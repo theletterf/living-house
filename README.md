@@ -45,9 +45,11 @@ python3 -m http.server 8642
 
 Open http://localhost:8642.
 
-1. **Pick a model**: Qwen2.5 0.5B or 1.5B Instruct. The download starts right away
-   (several hundred MB the first time, cached by the browser after that). 1.5B gives
-   noticeably better changes.
+1. **Pick a model**: Qwen2.5 (0.5B, 1.5B, 3B), Qwen3 (1.7B, 4B, run with thinking off)
+   or Llama 3.2 3B. The download starts right away (from several hundred MB to a few GB
+   the first time, cached by the browser after that). Qwen2.5 1.5B is the smallest that
+   works well: on an M-series laptop a round takes about 4–6 s and it handled all
+   requests in testing. 3B and 4B models need more memory and should do better.
 2. **Edit the prompt** (optional). Choose the app to adapt (smart home or workspace) and
    edit the base prompt. Below it you choose which kinds of change the model may make,
    which signals it observes, the timing thresholds and the temperature. "Full prompt
@@ -88,8 +90,8 @@ The panel on the right controls the session:
   - *Gentle*: after a 2.5 s pause, at most every 12 s, 1 change, only when you seem stuck.
   - *Balanced*: after a 1.2 s pause, at most every 5 s, up to 2 changes.
   - *Max* (default): every action starts a round right away, and the model must propose
-    at least one change. If all its proposals are rejected, it is asked once more with
-    the reasons.
+    at least one change. There is no retry when a proposal is rejected: it doubled the
+    wait and small models mostly repeated themselves.
 - **End session** stops adapting and shows a summary: how long the session lasted, how
   many changes were kept or undone, your requests, how many suggestions you accepted or
   declined, what you did, and every change grouped by page. From there you can start a
@@ -167,7 +169,7 @@ confusion. Every signal can be switched off and every threshold changed in the s
 | Change | Applies to |
 |---|---|
 | Text | Any element with text: buttons, nav items, headings, intro lines, list rows, the brand |
-| Style | Any element, any CSS: colors, borders, radius, spacing, fonts, shadows… |
+| Style | Any element: one CSS property from a list of 24 (font size and weight, colors, borders, radius, spacing, shadow, opacity, display, transform…) and its value |
 | Hint | A one-line note under a control |
 | Move first | A control, to the front of its toolbar or the sidebar |
 | Pin | An action or a switch, to the Quick actions bar shown on every page |
@@ -188,8 +190,15 @@ confusion. Every signal can be switched off and every threshold changed in the s
   the person's standing requests, and answers in JSON.
 - Adding an app means adding a scenario to `scenarios.js`: pages with an intro line and
   list rows, and controls of kind `nav`, `action`, `toggle`, `slider` or `stepper`.
-- Decoding is constrained by a JSON schema whose `op` and `id` fields are enums, so the
-  model can only emit enabled change types on elements that exist.
+- Decoding is constrained by a JSON schema with one shape per change type: each limits
+  `id` to the kinds of element it applies to (text only where there is text, pins only
+  on actions and switches), and a restyle picks its property from a fixed list. Small
+  models got the old shared `text` field wrong (labels sent as CSS, empty styles). The
+  schema doesn't depend on what is locked or pinned, so WebLLM can reuse its compiled
+  grammar between rounds.
+- The context is kept short, since reading it is most of a round's time: full detail
+  for the current page, the shared parts and anything touched recently, one line per
+  other page, and a list of changes already made so the model doesn't repeat them.
 - Every proposal is validated before it's applied. Style changes are checked with
   `CSS.supports`, and values that would load anything from outside (`url()`, `@import`,
   …) are refused.

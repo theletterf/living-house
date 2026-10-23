@@ -524,9 +524,11 @@ function buildContext() {
       hoverMs: 0, hesitations: 0, clicks: 0, ...stats.get(id),
     };
   });
+  const done = state.changes.filter((c) => !c.undone).slice(-8)
+    .map((c) => `${c.op} ${c.id}${c.text ? ` "${c.text}"` : ""}`);
   return {
     level: level(), config: state.config, about: S().about, view: p, elements,
-    recent: recent.slice(-20), preferences: state.preferences.slice(-6),
+    recent: recent.slice(-20), preferences: state.preferences.slice(-6), done,
   };
 }
 
@@ -537,10 +539,9 @@ async function runRound() {
   const t0 = now();
   const round = { at: t0, kind: "adapt", engine: state.engineKey, intensity: state.intensity, configVersion: state.configVersion, attempts: 0, raw: [], accepted: [], rejected: [] };
   try {
-    // At "Max" a round must change something: if every proposal is rejected,
-    // ask once more, telling the model why.
-    const tries = ctx.level.always ? 2 : 1;
-    while (round.attempts < tries && !round.accepted.length) {
+    // One attempt only. A retry with the rejection reasons doubled the wait,
+    // and small models mostly repeated the rejected change anyway.
+    while (round.attempts < 1) {
       round.attempts++;
       const res = await state.engine.propose({ ...ctx, rejected: round.rejected });
       round.raw.push(res.raw);
@@ -568,7 +569,12 @@ async function runRound() {
 function finishRound(round, t0) {
   round.latencyMs = now() - t0;
   state.rounds.push(round);
-  log("round", { kind: round.kind, engine: round.engine, latencyMs: round.latencyMs, attempts: round.attempts, accepted: round.accepted.length, rejected: round.rejected.length, error: round.error });
+  log("round", {
+    kind: round.kind, engine: round.engine, latencyMs: round.latencyMs, attempts: round.attempts,
+    accepted: round.accepted.length, rejected: round.rejected.length, error: round.error,
+    // The first rejection says what went wrong, which a bare count doesn't.
+    why: round.rejected[0] && `${round.rejected[0].op} ${round.rejected[0].id}: ${round.rejected[0].why}`,
+  });
   state.busy = false;
   state.lastRound = now();
   // Anything that arrived while the model was busy gets its own round.
@@ -723,7 +729,9 @@ async function runRequest(req) {
     if (req.changes.length) {
       render();
       renderChanges();
-      req.reply = reply || "Done.";
+      // Say what was actually done; small models' replies often just echo
+      // the request or contradict what they did.
+      req.reply = `Done: ${req.changes.map((n) => appliedText(state.changes.find((c) => c.n === n))).join("; ")}.`;
     } else if (modelDeclined) {
       req.reply = reply || "I couldn't do that.";
     } else {
@@ -738,6 +746,16 @@ async function runRequest(req) {
     renderRequestFeedback(req);
     finishRound(round, t0);
   }
+}
+
+function appliedText(c) {
+  return {
+    text: `renamed “${c.label}” to “${c.text}”`,
+    style: `restyled “${c.label}” (${c.text})`,
+    hint: `added a hint under “${c.label}”`,
+    move_first: `moved “${c.label}” to the front`,
+    pin: `pinned “${c.label}” to Quick actions`,
+  }[c.op];
 }
 
 function renderRequestFeedback(req) {
@@ -1539,7 +1557,7 @@ function renderActivity() {
   const items = state.events.slice(-14).reverse().map((e) => {
     const text = CONTEXT_EVENTS.has(e.type) ? describeEvent(e)
       : e.type === "change" ? `change #${e.n}: ${e.op} ${e.id}${e.requested ? " (requested)" : ""}`
-      : e.type === "round" ? `${e.kind === "request" ? "request round" : "round"}: ${e.accepted} accepted, ${e.rejected} rejected${e.attempts > 1 ? `, ${e.attempts} tries` : ""} (${e.latencyMs} ms)${e.error ? `. Error: ${e.error}` : ""}`
+      : e.type === "round" ? `${e.kind === "request" ? "request round" : "round"}: ${e.accepted} accepted, ${e.rejected} rejected${e.attempts > 1 ? `, ${e.attempts} tries` : ""} (${(e.latencyMs / 1000).toFixed(1)} s)${e.why && !e.accepted ? `. Rejected ${e.why}` : ""}${e.error ? `. Error: ${e.error}` : ""}`
       : e.type === "expired" ? `unanswered change expired: ${e.op} ${e.id}`
       : e.type === "ask_first" ? `ask before each change: ${e.on ? "on" : "off"}`
       : e.type === "welcome_closed" ? "training-mode notice closed"
