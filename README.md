@@ -111,6 +111,40 @@ and offers to end with a small popover:
 *Keep going* restarts the detector from that moment, so it doesn't nag. Both the
 suggestion and the friction-free time can be changed in the setup.
 
+### Live help
+
+An adaptive UI sounds impossible to document: every person's layout ends up different.
+Living House documents it anyway, because every element has a permanent ID that the model
+can't change. It can change an element's text, look and place, never its identity (the
+output schema only accepts existing IDs, and nothing can create or delete elements).
+
+*Help* in the ask bar opens articles written against those IDs, not against labels or
+screenshots:
+
+```
+On {{nav_overview}}, choose {{sc_movie}}. It switches off {{lr_ceiling}}, …
+```
+
+renders, for someone who asked to rename the ceiling light, as:
+
+> On **Overview**, choose **Movie night**. It switches off **Main light** (formerly
+> "Ceiling"), …
+
+- Every name is a *Show me* link: it goes to the right page and spotlights the element,
+  instead of a screenshot that would never match.
+- `{{value:id}}` shows live state ("The door is **Locked** right now"), and paragraphs
+  starting with `{{if pinned:id}}` or `{{unless pinned:id}}` only show when that holds,
+  so advice follows the layout.
+- Search matches every name an element has had: "Ceiling" still finds the article, and
+  says it's now called "Main light".
+- *All controls* is a reference generated from the registry: every control, what it
+  does, its current name and state, and whether it's pinned.
+- Articles are checked against the registry when the app loads; a reference to an
+  element that doesn't exist is reported as an error.
+- Using the help feeds back into adaptation: looking something up means it was hard to
+  find, so the model sees it (at *Max* it reacts right away), and it counts as friction
+  for the settled detector.
+
 ### Keeping the layout
 
 *Keep this layout* in the summary saves how the app differs from the original (texts,
@@ -144,6 +178,7 @@ confusion. Every signal can be switched off and every threshold changed in the s
 |---|---|
 | `index.html` | Setup, ask bar, app stage, popovers, training-mode notice, session summary, panel |
 | `scenarios.js` | The apps that can be adapted, as plain data: pages, rows and controls |
+| `docs.js` | Help articles for each app, written as templates against element IDs |
 | `app.js` | Element registry, rendering, signal logging, requests, validation, applying and undoing changes, session summary |
 | `adapters.js` | Model loading, prompt building, JSON-schema-constrained decoding |
 | `styles.css` | Styles (light theme only) |

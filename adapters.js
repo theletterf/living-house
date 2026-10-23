@@ -72,6 +72,7 @@ How to read the activity:
 - Hesitation means confusion. Pausing on a control without clicking means its label is unclear. Pausing on a page without doing anything means the person can't see what they need there.
 - Searching (visiting several pages, clicking the wrong control first) also means a label or place is unclear.
 - Repeating the same action shows a habit. Make habitual controls easier to reach.
+- Looking something up in the help means the person couldn't find it on their own. Make that element easier to find.
 - Selecting or pointing at text shows what the person wants. Change that text's element, or the control whose "what it is" best matches the text, so it is easier to find.
 - The person may be asked to confirm your changes. Accepted changes show what they like. After a declined change, try a different kind of change instead.
 
@@ -163,6 +164,8 @@ export function describeEvent(e) {
     case "read": return `pointed at ${e.id} "${e.text}" ${s(e.ms)} on page "${e.view}"`;
     case "decision": return `${e.accepted ? "accepted" : "declined"} your proposed change: ${e.op} ${e.id} "${e.text ?? ""}"`;
     case "request": return `asked you: "${e.text}"${e.id ? ` (about ${e.id})` : ""}`;
+    case "help_open": return `opened the help article "${e.title}"`;
+    case "help_show": return `looked up ${e.id} "${e.label}" in the help (couldn't find it on their own)`;
     default: return e.type;
   }
 }

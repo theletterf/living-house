@@ -331,6 +331,64 @@ button.link { border: 0; background: none; padding: 4px 0; color: var(--accent);
 .ask-status[hidden], .ask-status button[hidden] { display: none; }
 .ask-status button { margin-left: 8px; }
 
+.help-btn {
+  border: 1px solid var(--line) !important; background: var(--surface) !important; color: var(--ink) !important;
+  font-weight: 500 !important;
+}
+
+/* ---------- help drawer (over the app's right edge, out of the model's reach) ---------- */
+
+.help {
+  position: absolute;
+  z-index: 5;
+  top: 62px;
+  right: 0;
+  width: 340px;
+  max-width: calc(100% - 16px);
+  max-height: calc(100% - 62px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 10px 32px rgba(29, 29, 31, 0.14);
+  overflow: auto;
+}
+.help[hidden] { display: none; }
+.help-head { display: flex; align-items: center; gap: 8px; }
+.help-head h2 { flex: 1; margin: 0; font-size: 16px; }
+.help-head .link[hidden] { display: none; }
+.help-close { border: 0; background: none; font-size: 20px; line-height: 1; cursor: pointer; color: var(--muted); }
+#help-search { font: inherit; font-size: 14px; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+#help-search[hidden] { display: none; }
+.help-body { font-size: 14px; line-height: 1.55; }
+.help-body p { margin: 0 0 10px; }
+.help-body h4 { margin: 12px 0 4px; font-size: 13px; }
+.help-list { list-style: none; margin: 0; padding: 0; }
+.help-list li { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.help-list button { display: block; border: 0; background: none; padding: 0; font: inherit; font-weight: 600; color: var(--accent); cursor: pointer; text-align: left; }
+.help-list span { display: block; font-size: 12.5px; color: var(--muted); }
+.help-ref { margin: 0; padding-left: 16px; }
+.help-ref li { margin-bottom: 4px; }
+.help-desc { display: block; font-size: 12.5px; color: var(--muted); }
+.ref {
+  border: 0; background: none; padding: 0; font: inherit; font-weight: 600; color: var(--ink);
+  border-bottom: 1px dashed var(--accent); cursor: pointer;
+}
+.ref:hover { color: var(--accent); }
+.aka { font-size: 12.5px; color: var(--muted); }
+.ref-missing { color: var(--warn); font-family: ui-monospace, monospace; }
+.help-foot { margin: 0; font-size: 12px; color: var(--muted); }
+
+.spotlight { animation: spotlight 1.3s ease-out 2; }
+@keyframes spotlight {
+  0% { box-shadow: 0 0 0 0 rgba(240, 140, 0, 0.6); }
+  40% { box-shadow: 0 0 0 8px rgba(240, 140, 0, 0.35); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
 /* ---------- training-mode notice ---------- */
 
 .welcome {

@@ -72,12 +72,24 @@
         <input id="ask-input" type="text" aria-label="Ask for a change">
         <kbd class="ask-kbd">⌘K</kbd>
         <button type="submit">Ask</button>
+        <button type="button" id="help-open" class="help-btn" aria-controls="help">Help</button>
       </form>
       <p id="ask-status" class="ask-status" hidden>
         <span id="ask-reply"></span>
         <button id="ask-undo" type="button" class="link">Undo</button>
       </p>
       <div id="app-wrap"><div id="app" class="app"></div></div>
+
+      <aside id="help" class="help" aria-label="Help" hidden>
+        <header class="help-head">
+          <button type="button" id="help-back" class="link" hidden>← All topics</button>
+          <h2 id="help-title">Help</h2>
+          <button type="button" id="help-close" class="help-close" aria-label="Close help">×</button>
+        </header>
+        <input id="help-search" type="search" placeholder="Search, even by old names…" aria-label="Search the help">
+        <div id="help-body" class="help-body"></div>
+        <p class="help-foot">Written against element IDs, so these pages always match your layout. Click a name to see it in the app.</p>
+      </aside>
     </div>
     <div id="toast" class="toast" role="status"></div>
 
@@ -130,7 +142,7 @@
       <p>You can also ask for changes: type in the bar above the app, or right-click anything and choose what should change.</p>
       <p id="welcome-saved-note" hidden>It picks up from the layout you kept last time.</p>
       <p id="welcome-confirm-note">Before each change it suggests on its own, a small note will ask you first. Choose Apply to make the change or Not now to skip it.</p>
-      <p class="welcome-small">Nothing leaves your browser. Changes can be undone at any time.</p>
+      <p class="welcome-small">Nothing leaves your browser. Changes can be undone at any time, and the Help always matches what you see.</p>
       <button class="start" value="ok" autofocus>Got it</button>
     </form>
   </dialog>

@@ -1,13 +1,16 @@
 import { DEFAULT_GUIDANCE, ENGINES, INTENSITIES, OPS, buildSystemPrompt, describeEvent, loadEngine } from "./adapters.js";
 import { DEFAULT_SCENARIO, SCENARIOS } from "./scenarios.js";
+import { CONDITION, DOCS, TOKEN } from "./docs.js";
 
 const MAX_PINS = 4;
 const MODEL_EVENTS = new Set(["hover", "hesitate", "click", "set", "nav", "select", "read"]);
 // At "Max" each of these starts a round. A plain hover is context, not an action.
-const ACTION_EVENTS = new Set(["hesitate", "click", "set", "nav", "select", "read"]);
+// Looking something up in the help means it was hard to find, so it counts too.
+const ACTION_EVENTS = new Set(["hesitate", "click", "set", "nav", "select", "read", "help_show"]);
 // What the model sees as recent activity: the signals plus the person's answers
-// to proposed changes and their own requests (neither can be switched off).
-const CONTEXT_EVENTS = new Set([...MODEL_EVENTS, "decision", "request"]);
+// to proposed changes, their own requests and their use of the help (none of
+// which can be switched off).
+const CONTEXT_EVENTS = new Set([...MODEL_EVENTS, "decision", "request", "help_open", "help_show"]);
 const MAX_PROPOSALS = 3; // confirmations waiting at once; older ones expire
 const CONTROL_KINDS = new Set(["nav", "action", "toggle", "slider", "stepper"]);
 const PINNABLE = new Set(["action", "toggle"]);
@@ -117,6 +120,9 @@ const state = {
   pointer: { x: -1, y: -1, down: false, inApp: false, enteredApp: 0 },
   hover: null,
   flashUntil: new Map(),
+  spotUntil: new Map(), // elements highlighted by the help's Show me
+  helpOpen: false,
+  helpArticle: null,    // an article id, "reference", or null for the topic list
   status: "",
   config: defaultConfig(),
   draft: null,       // the config being edited in the setup
@@ -317,9 +323,14 @@ function render() {
   for (const [id, until] of state.flashUntil) {
     if (until > t) for (const node of document.querySelectorAll(`[data-id="${id}"]`)) node.classList.add("flash");
   }
+  for (const [id, until] of state.spotUntil) {
+    if (until > t) for (const node of $app.querySelectorAll(`[data-id="${id}"]`)) node.classList.add("spotlight");
+  }
   restoreSelection(selection);
-  // Popover wording ("On the … page") and anchors depend on the page shown.
+  // Popover wording ("On the … page") and anchors depend on the page shown,
+  // and the help renders whatever the elements are called right now.
   renderConfirm();
+  renderHelp();
 }
 
 let toastTimer;
@@ -760,6 +771,170 @@ function undoRequest(req) {
   renderRequestFeedback(req);
 }
 
+// ---------- help: live docs written against element IDs ----------
+
+const originalLabel = (id) => S().controls.find((c) => c.id === id)?.text ?? null;
+const docIds = (body) => [
+  ...[...body.matchAll(TOKEN)].map((m) => m[2]),
+  ...body.split("\n\n").map((p) => p.match(CONDITION)?.[2]).filter(Boolean),
+];
+
+// The paragraphs that apply to this layout right now.
+function paragraphs(body) {
+  return body.split("\n\n").flatMap((p) => {
+    const cond = p.match(CONDITION);
+    if (!cond) return [p];
+    const holds = Boolean(state.els.get(cond[2])?.pinned);
+    return (cond[1] === "if") === holds ? [p.replace(CONDITION, "")] : [];
+  });
+}
+
+// Every name an element has had: the original, renames this session, and now.
+function aliases(id) {
+  const el = state.els.get(id);
+  const names = [originalLabel(id), ...state.changes.filter((c) => c.id === id && c.op === "text").map((c) => c.label), el && labelOf(el)];
+  return [...new Set(names.filter(Boolean))];
+}
+
+// Why an element looks the way it does, for the reference's tooltip.
+function changeNote(id) {
+  const last = state.changes.filter((c) => c.id === id && !c.undone).at(-1);
+  if (last) return last.requested ? "changed at your request" : `changed by the ${S().noun}: ${last.reason}`;
+  const el = state.els.get(id);
+  return el && originalLabel(id) && originalLabel(id) !== labelOf(el) ? "changed in an earlier session" : "";
+}
+
+// A reference to an element: its current label as a Show me link, plus
+// "formerly …" and "also in your Quick actions" the first time it appears.
+function refHTML(id, seen) {
+  const el = state.els.get(id);
+  if (!el) return `<span class="ref-missing">${esc(id)}</span>`;
+  const label = labelOf(el);
+  const notes = [];
+  if (!seen.has(id)) {
+    seen.add(id);
+    const original = originalLabel(id);
+    if (original && original !== label) notes.push(`formerly “${esc(original)}”`);
+    if (el.pinned) notes.push("also in your Quick actions");
+  }
+  const why = changeNote(id);
+  return `<button type="button" class="ref" data-ref="${id}" title="Show me${why ? ` · ${esc(why)}` : ""}">${esc(label)}</button>${notes.length ? ` <span class="aka">(${notes.join(", ")})</span>` : ""}`;
+}
+
+function renderTemplate(body) {
+  const seen = new Set();
+  return paragraphs(body).map((para) => `<p>${esc(para).replace(TOKEN, (_, isValue, id) => {
+    const el = state.els.get(id);
+    return isValue ? `<strong>${esc((el && valueText(el)) ?? "?")}</strong>` : refHTML(id, seen);
+  })}</p>`).join("");
+}
+
+const plainTemplate = (body) => paragraphs(body).join("\n\n").replace(TOKEN, (_, isValue, id) => {
+  const el = state.els.get(id);
+  return el ? (isValue ? valueText(el) ?? "" : labelOf(el)) : id;
+});
+
+// The reference is generated from the registry itself: every control, what it
+// does, what it's called and where it is in this person's layout right now.
+function referenceHTML() {
+  const groups = [["Navigation", toolbar("nav")], ...Object.keys(S().pages).map((p) => [pageName(p), toolbar(p)])];
+  return groups.map(([name, items]) => `
+    <h4>${esc(name)}</h4>
+    <ul class="help-ref">${items.map((c) => {
+      const value = valueText(c);
+      return `<li>${refHTML(c.id, new Set())}<span class="help-desc">${esc(c.desc)}${value ? ` · now <strong>${esc(value)}</strong>` : ""}</span></li>`;
+    }).join("")}</ul>`).join("");
+}
+
+function helpTopics() {
+  const docs = DOCS[state.scenario] ?? [];
+  const reference = {
+    id: "reference",
+    title: "All controls",
+    blurb: "Every control, what it does, and what it's called in your layout",
+    ids: controls().map((c) => c.id),
+    text: controls().map((c) => c.desc).join(" "),
+  };
+  return [
+    ...docs.map((d) => ({ id: d.id, title: d.title, blurb: plainTemplate(d.body).split("\n\n")[0], ids: docIds(d.body), text: plainTemplate(d.body) })),
+    reference,
+  ];
+}
+
+function renderHelp() {
+  $("help").hidden = !state.helpOpen || state.setupOpen;
+  if ($("help").hidden) return;
+  const query = $("help-search").value.trim().toLowerCase();
+  const article = state.helpArticle;
+  $("help-back").hidden = !article;
+  $("help-search").hidden = Boolean(article);
+
+  if (article === "reference") {
+    $("help-title").textContent = "All controls";
+    $("help-body").innerHTML = referenceHTML();
+    return;
+  }
+  if (article) {
+    const doc = DOCS[state.scenario].find((d) => d.id === article);
+    $("help-title").textContent = doc.title;
+    $("help-body").innerHTML = renderTemplate(doc.body);
+    return;
+  }
+
+  // Topic list. Search covers titles, text as currently labelled, and every
+  // name an element has ever had, so old names still find things.
+  $("help-title").textContent = "Help";
+  const words = query.split(/\s+/).filter(Boolean);
+  const items = helpTopics().map((topic) => {
+    const names = topic.ids.flatMap(aliases);
+    const hay = [topic.title, topic.text, ...names].join(" ").toLowerCase();
+    if (!words.every((w) => hay.includes(w))) return "";
+    // Say so when the match was an old name.
+    const renamed = query ? topic.ids.flatMap((id) => {
+      const current = labelOf(state.els.get(id));
+      return aliases(id).filter((a) => a !== current && a.toLowerCase().includes(query)).map((a) => `“${esc(a)}” is now “${esc(current)}”`);
+    }) : [];
+    return `<li><button type="button" data-article="${topic.id}">${esc(topic.title)}</button><span>${renamed.length ? `<em>${[...new Set(renamed)].join(", ")}</em>` : esc(topic.blurb)}</span></li>`;
+  }).filter(Boolean);
+  $("help-body").innerHTML = items.length ? `<ul class="help-list">${items.join("")}</ul>` : `<p class="note">No topics match “${esc(query)}”.</p>`;
+}
+
+function openHelp(article = null) {
+  state.helpOpen = true;
+  setHelpArticle(article);
+}
+
+function setHelpArticle(article) {
+  state.helpArticle = article;
+  if (article) {
+    const title = article === "reference" ? "All controls" : DOCS[state.scenario].find((d) => d.id === article)?.title;
+    log("help_open", { article, title });
+  }
+  renderHelp();
+}
+
+// Show me: go to the element's page if it isn't visible, and spotlight it.
+function showMe(id) {
+  const el = state.els.get(id);
+  if (!el) return;
+  log("help_show", { id, label: labelOf(el) });
+  if (el.page !== "all" && el.page !== state.view && !el.pinned) state.view = el.page;
+  state.spotUntil.set(id, now() + 2600);
+  render();
+}
+
+// The help must only reference elements that exist; say so loudly if not.
+function lintDocs() {
+  for (const [scenario, docs] of Object.entries(DOCS)) {
+    const ids = new Set(SCENARIOS[scenario].controls.map((c) => c.id));
+    for (const doc of docs) {
+      for (const id of docIds(doc.body)) {
+        if (!ids.has(id)) console.error(`Help article "${doc.id}" (${scenario}) references unknown element "${id}".`);
+      }
+    }
+  }
+}
+
 // ---------- confirming changes ----------
 // With "Ask before each change" on, a change shows up as a small popover next
 // to the element it would change. Apply makes it; Not now drops it and tells
@@ -982,6 +1157,8 @@ function resetSession() {
   state.preferences = [];
   state.declined.clear();
   state.flashUntil.clear();
+  state.spotUntil.clear();
+  state.helpArticle = null;
   state.pageHesitated = false;
   state.lastSelection = "";
   state.ended = false;
@@ -1047,6 +1224,7 @@ function summarize() {
     pages: count("nav"),
     hesitations: count("hesitate"),
     selections: count("select"),
+    helpLookups: count("help_open") + count("help_show"),
     rounds: rounds.length,
     avgLatencyMs: rounds.length ? Math.round(rounds.reduce((sum, r) => sum + r.latencyMs, 0) / rounds.length) : 0,
   };
@@ -1069,7 +1247,8 @@ function openSummary() {
   const times = (n, one, many) => `${n} ${n === 1 ? one : many}`;
   $("summary-activity").textContent =
     `You clicked or adjusted things ${times(s.actions, "time", "times")}, changed pages ${times(s.pages, "time", "times")}, ` +
-    `hesitated ${times(s.hesitations, "time", "times")} and selected text ${times(s.selections, "time", "times")}. ` +
+    `hesitated ${times(s.hesitations, "time", "times")}, selected text ${times(s.selections, "time", "times")} ` +
+    `and used the help ${times(s.helpLookups, "time", "times")}. ` +
     `The model ran ${times(s.rounds, "round", "rounds")}${s.rounds ? `, ${(s.avgLatencyMs / 1000).toFixed(1)} s each on average` : ""}.`;
 
   // Every change, grouped by the page it is on; "Everywhere" for shared parts.
@@ -1115,7 +1294,8 @@ function settledReason(t) {
   let calmFrom = since;
   let navRun = 0;
   for (const e of events) {
-    if (e.type === "hesitate") calmFrom = e.t;
+    // Needing the help is friction too.
+    if (e.type === "hesitate" || e.type === "help_open" || e.type === "help_show") calmFrom = e.t;
     if (e.type === "nav") {
       if (++navRun >= 3) calmFrom = e.t;
     } else if (e.type === "click" || e.type === "set") {
@@ -1476,6 +1656,7 @@ function setupControls() {
   }, true);
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && state.request) closeRequest();
+    else if (ev.key === "Escape" && state.helpOpen && !state.modalOpen) closeHelp();
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k" && canRequest()) {
       ev.preventDefault();
       $("ask-input").focus();
@@ -1518,8 +1699,25 @@ function setupControls() {
     if (t?.dataset.undo) undo(Number(t.dataset.undo));
   });
 
+  // Help drawer.
+  $("help-open").addEventListener("click", () => (state.helpOpen ? closeHelp() : openHelp()));
+  $("help-close").addEventListener("click", closeHelp);
+  $("help-back").addEventListener("click", () => setHelpArticle(null));
+  $("help-search").addEventListener("input", renderHelp);
+  $("help-body").addEventListener("click", (ev) => {
+    const ref = ev.target.closest("[data-ref]");
+    if (ref) return showMe(ref.dataset.ref);
+    const topic = ev.target.closest("[data-article]");
+    if (topic) setHelpArticle(topic.dataset.article);
+  });
+
   $("start-over").addEventListener("click", startOver);
   $("export").addEventListener("click", exportLog);
+}
+
+function closeHelp() {
+  state.helpOpen = false;
+  renderHelp();
 }
 
 function exportLog() {
@@ -1537,6 +1735,7 @@ function exportLog() {
 
 // ---------- boot ----------
 
+lintDocs();
 seed();
 state.view = firstPage();
 setupControls();
