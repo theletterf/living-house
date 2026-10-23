@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Living House</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="stage">
+    <section id="setup" class="setup">
+      <h1>Set up the adapter</h1>
+      <p class="note">A model watches how you use the app and changes its interface as you go.</p>
+
+      <div class="step">
+        <span class="step-n">1</span>
+        <div class="step-body">
+          <h2>Pick a model</h2>
+          <select id="engine"></select>
+          <p id="model-status" class="note"></p>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="step-n">2</span>
+        <div class="step-body">
+          <h2>Edit the prompt <span class="optional">optional</span></h2>
+          <p class="note">This is the base prompt. The settings below add the rest: what the model may change, how eager it is, and the answer format.</p>
+          <textarea id="prompt" rows="14" spellcheck="false"></textarea>
+          <button id="prompt-reset" type="button" class="link">Reset to default</button>
+
+          <h3>Changes the model may make</h3>
+          <div id="ops" class="chips"></div>
+
+          <h3>What it observes</h3>
+          <div id="signals" class="chips"></div>
+
+          <h3>Timing and temperature</h3>
+          <div class="params">
+            <label>Hesitation on a control after <input type="number" id="p-hesitate" min="0.3" max="10" step="0.1"> s</label>
+            <label>Hesitation on a page after <input type="number" id="p-page" min="1" max="30" step="0.5"> s</label>
+            <label>Pointing at text counts after <input type="number" id="p-read" min="0.2" max="5" step="0.1"> s</label>
+            <label>Temperature <input type="range" id="p-temp" min="0" max="1" step="0.05"> <output id="p-temp-out"></output></label>
+          </div>
+
+          <details class="preview">
+            <summary>Full prompt sent to the model</summary>
+            <pre id="prompt-preview"></pre>
+            <p class="note">Each round also sends a message listing every control and the recent activity.</p>
+          </details>
+        </div>
+      </div>
+
+      <div class="setup-actions">
+        <button id="start" type="button" class="start">Start</button>
+        <button id="setup-cancel" type="button" class="link" hidden>Back to the app without changes</button>
+        <span id="start-note" class="note"></span>
+      </div>
+    </section>
+
+    <div id="app-wrap" hidden><div id="app" class="app"></div></div>
+    <div id="toast" class="toast" role="status"></div>
+
+    <div id="confirm" class="confirm" role="dialog" aria-label="Suggested change" hidden>
+      <p class="confirm-kicker">Suggested change</p>
+      <p id="confirm-what" class="confirm-what"></p>
+      <p id="confirm-why" class="confirm-why"></p>
+      <div class="confirm-actions">
+        <button id="confirm-yes" type="button" class="confirm-yes">Apply</button>
+        <button id="confirm-no" type="button" class="confirm-no">Not now</button>
+        <span id="confirm-more" class="confirm-more"></span>
+      </div>
+    </div>
+  </div>
+
+  <dialog id="welcome" class="welcome" aria-labelledby="welcome-title">
+    <form method="dialog">
+      <p class="welcome-kicker">Training mode</p>
+      <h2 id="welcome-title">This app adapts to you</h2>
+      <p>While you use it, it watches what you click, where you pause and what you select, and adjusts itself: wording, layout and styles can change to make things easier to find.</p>
+      <p id="welcome-confirm-note">Before each change, a small note will ask you first. Choose Apply to make the change or Not now to skip it.</p>
+      <p class="welcome-small">Nothing leaves your browser. Changes can be undone at any time.</p>
+      <button class="start" value="ok" autofocus>Got it</button>
+    </form>
+  </dialog>
+
+  <aside class="panel">
+    <section>
+      <h2>Adapter</h2>
+      <div class="row">
+        <span id="model-name" class="model-name">No model yet</span>
+        <button id="edit-setup">Edit prompt</button>
+      </div>
+      <label class="check"><input type="checkbox" id="adaptive" checked> Adapt the UI</label>
+      <label class="check"><input type="checkbox" id="ask-first" checked> Ask before each change</label>
+      <div class="intensity">
+        <span class="intensity-label">Intensity</span>
+        <div id="intensity" class="segmented" role="group" aria-label="Change intensity"></div>
+      </div>
+      <p id="intensity-blurb" class="note intensity-blurb"></p>
+      <p id="status" class="status"></p>
+      <div class="start-over">
+        <button id="start-over">Start over</button>
+        <span class="note">Fresh visit with the original layout. Doesn't count as undoing anything.</span>
+      </div>
+    </section>
+
+    <section>
+      <h2>Changes</h2>
+      <ol id="changes" class="changes"></ol>
+    </section>
+
+    <section>
+      <h2>Activity</h2>
+      <ol id="activity" class="activity"></ol>
+      <button id="export">Export log (JSONL)</button>
+    </section>
+  </aside>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
