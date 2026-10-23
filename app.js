@@ -1,13 +1,16 @@
 import { DEFAULT_GUIDANCE, ENGINES, INTENSITIES, OPS, buildSystemPrompt, describeEvent, loadEngine } from "./adapters.js";
+import { DEFAULT_SCENARIO, SCENARIOS } from "./scenarios.js";
 
 const MAX_PINS = 4;
-const MODEL_EVENTS = new Set(["hover", "hesitate", "click", "nav", "select", "read"]);
+const MODEL_EVENTS = new Set(["hover", "hesitate", "click", "set", "nav", "select", "read"]);
 // At "Max" each of these starts a round. A plain hover is context, not an action.
-const ACTION_EVENTS = new Set(["hesitate", "click", "nav", "select", "read"]);
+const ACTION_EVENTS = new Set(["hesitate", "click", "set", "nav", "select", "read"]);
 // What the model sees as recent activity: the signals plus the person's answers
-// to proposed changes (not a signal that can be switched off).
-const CONTEXT_EVENTS = new Set([...MODEL_EVENTS, "decision"]);
+// to proposed changes and their own requests (neither can be switched off).
+const CONTEXT_EVENTS = new Set([...MODEL_EVENTS, "decision", "request"]);
 const MAX_PROPOSALS = 3; // confirmations waiting at once; older ones expire
+const CONTROL_KINDS = new Set(["nav", "action", "toggle", "slider", "stepper"]);
+const PINNABLE = new Set(["action", "toggle"]);
 
 const OP_LABELS = {
   text: "Change any text",
@@ -19,7 +22,7 @@ const OP_LABELS = {
 
 // Signals the model can observe; each can be switched off in the setup.
 const SIGNALS = {
-  click: "Clicks",
+  click: "Clicks and control changes",
   nav: "Page changes",
   hover: "Hovering over controls",
   hesitate_control: "Hesitating on a control",
@@ -27,9 +30,11 @@ const SIGNALS = {
   select: "Selecting text",
   read: "Pointing at text",
 };
-const signalOf = (type, data) => (type === "hesitate" ? (data.id ? "hesitate_control" : "hesitate_page") : type);
+const signalOf = (type, data) =>
+  type === "hesitate" ? (data.id ? "hesitate_control" : "hesitate_page") : type === "set" ? "click" : type;
 
 const defaultConfig = () => ({
+  scenario: DEFAULT_SCENARIO,
   prompt: DEFAULT_GUIDANCE,
   ops: [...OPS],
   signals: Object.keys(SIGNALS),
@@ -39,65 +44,22 @@ const defaultConfig = () => ({
   temperature: 0.2,
 });
 
-// ---------- the app being adapted ----------
-// Every element has an id the model can target. Labels are deliberately vague
-// so there is something to fix.
-
-const PAGES = {
-  home: { lede: "Welcome back. Here's what changed since yesterday.", rows: ["Q4 roadmap edited by Priya", "3 comments on Launch checklist", "Weekly sync notes added"] },
-  projects: { lede: "All projects in this workspace.", rows: ["Launch checklist · 12 tasks", "Q4 roadmap · 31 tasks", "Hiring pipeline · 8 tasks"] },
-  team: { lede: "Everyone with access to this workspace.", rows: ["Ana Ruiz · Owner", "Sam Okafor · Editor", "Lee Chen · Viewer"] },
-  billing: { lede: "Team plan · renews Nov 14.", rows: ["Visa ending 4242", "Oct 2026 · $96.00 · Paid", "Sep 2026 · $96.00 · Paid"] },
-  settings: { lede: "Workspace-wide settings.", rows: ["Workspace name: Atrium", "Default time zone: UTC+1", "Data region: EU"] },
-};
-
+// Elements every scenario has. The pages and controls come from scenarios.js.
 const GLOBALS = [
   { id: "app", kind: "box", desc: "The whole app frame" },
   { id: "header", kind: "box", desc: "Top bar of the app" },
-  { id: "brand", kind: "text", text: "Atrium", desc: "App name in the top bar" },
+  { id: "brand", kind: "text", desc: "App name in the top bar" },
   { id: "quick", kind: "box", desc: "Quick actions bar in the top bar, shown once something is pinned" },
   { id: "quick_label", kind: "text", text: "Quick actions", desc: "Label of the Quick actions bar" },
   { id: "sidebar", kind: "box", desc: "Left navigation sidebar" },
   { id: "main", kind: "box", desc: "Main content area" },
 ];
 
-const CONTROLS = [
-  { id: "nav_home", view: "nav", to: "home", text: "Home", desc: "Go to the home page" },
-  { id: "nav_projects", view: "nav", to: "projects", text: "Work", desc: "Go to the projects page" },
-  { id: "nav_team", view: "nav", to: "team", text: "People", desc: "Go to the team members page" },
-  { id: "nav_billing", view: "nav", to: "billing", text: "Account", desc: "Go to billing: plan, payment cards, invoices" },
-  { id: "nav_settings", view: "nav", to: "settings", text: "Preferences", desc: "Go to settings: notifications, data export" },
-
-  { id: "h_new", view: "home", text: "New", desc: "Create a new project" },
-  { id: "h_sync", view: "home", text: "Sync", desc: "Sync local changes with the server" },
-  { id: "h_recent", view: "home", text: "Recent", desc: "Open recently viewed items" },
-  { id: "h_updates", view: "home", text: "Updates", desc: "Show the product changelog" },
-
-  { id: "p_create", view: "projects", text: "Create", desc: "Start a new project from a template" },
-  { id: "p_shelve", view: "projects", text: "Shelve", desc: "Archive the selected project" },
-  { id: "p_link", view: "projects", text: "Link", desc: "Copy a share link for the selected project" },
-  { id: "p_labels", view: "projects", text: "Labels", desc: "Edit the selected project's tags" },
-
-  { id: "t_roles", view: "team", text: "Roles", desc: "Change what each member can do" },
-  { id: "t_groups", view: "team", text: "Groups", desc: "Organize members into groups" },
-  { id: "t_seats", view: "team", text: "Seats", desc: "Invite teammates by email and manage seats" },
-  { id: "t_activity", view: "team", text: "Activity", desc: "See who did what and when" },
-
-  { id: "b_plan", view: "billing", text: "Plan", desc: "Change or cancel your subscription" },
-  { id: "b_methods", view: "billing", text: "Methods", desc: "Add or remove payment cards" },
-  { id: "b_statements", view: "billing", text: "Statements", desc: "Download past invoices as PDF" },
-  { id: "b_usage", view: "billing", text: "Usage", desc: "See seats and storage used this month" },
-
-  { id: "s_general", view: "settings", text: "General", desc: "Rename the workspace and set the time zone" },
-  { id: "s_signals", view: "settings", text: "Signals", desc: "Choose which email and push notifications you get" },
-  { id: "s_takeout", view: "settings", text: "Takeout", desc: "Export all workspace data as a ZIP file" },
-  { id: "s_danger", view: "settings", text: "Danger zone", desc: "Delete the workspace" },
-];
-
 // ---------- state ----------
 
 const state = {
-  view: "home",
+  scenario: DEFAULT_SCENARIO,
+  view: null,
   els: new Map(),
   events: [],
   sessionStart: 0,  // the adapter never sees events from before the last "Start over"
@@ -105,15 +67,23 @@ const state = {
   changes: [],
   pending: [],      // validated changes waiting for a safe moment to apply
   proposals: [],    // validated changes waiting for the person to confirm them
+  requests: [],     // the person's own requests waiting for the model
+  preferences: [],  // everything the person asked for this session
   declined: new Set(),
+  request: null,    // the open "Change this" popover: { id, req }
+  barRequest: null, // the latest request made in the ask bar
   askFirst: true,
   modalOpen: false,
+  ended: false,
+  sessionBeganAt: 0,
+  endedAt: 0,
   rounds: [],
   adaptive: true,
   intensity: "max",
   engine: null,
   engineKey: null,
   busy: false,
+  requestBusy: false,
   loading: false,
   lastRound: 0,
   lastActivity: 0,
@@ -136,6 +106,8 @@ const $app = $("app");
 const now = () => Math.round(performance.now());
 const esc = (s) => String(s).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch]);
 const level = () => INTENSITIES[state.intensity];
+const S = () => SCENARIOS[state.scenario];
+const firstPage = () => Object.keys(S().pages)[0];
 
 function seed() {
   state.els.clear();
@@ -143,22 +115,22 @@ function seed() {
     text: null, page: "all", style: {}, hint: null, pinned: false, pinnedAt: 0,
     frozen: false, adapted: false, adaptReason: null, changeCount: 0, ...el,
   });
-  for (const g of GLOBALS) add(g);
-  for (const [p, page] of Object.entries(PAGES)) {
+  for (const g of GLOBALS) add(g.id === "brand" ? { ...g, text: S().brand } : g);
+  for (const [p, page] of Object.entries(S().pages)) {
     add({ id: `${p}.title`, kind: "text", page: p, desc: "Page heading" });
     add({ id: `${p}.lede`, kind: "text", page: p, text: page.lede, desc: "Intro line under the heading" });
-    add({ id: `${p}.toolbar`, kind: "box", page: p, desc: "Toolbar holding this page's actions" });
+    add({ id: `${p}.toolbar`, kind: "box", page: p, desc: "Area holding this page's controls" });
     add({ id: `${p}.rows`, kind: "box", page: p, desc: "List of items on this page" });
     page.rows.forEach((text, i) => add({ id: `${p}.row${i}`, kind: "text", page: p, text, desc: "Item in this page's list" }));
   }
   const orderByView = {};
-  for (const c of CONTROLS) {
+  for (const c of S().controls) {
     const order = (orderByView[c.view] = (orderByView[c.view] ?? -1) + 1);
-    add({ ...c, kind: c.view === "nav" ? "nav" : "action", page: c.view === "nav" ? "all" : c.view, order });
+    add({ ...c, kind: c.kind ?? (c.view === "nav" ? "nav" : "action"), page: c.view === "nav" ? "all" : c.view, order });
   }
 }
 
-const isControl = (el) => el.kind === "nav" || el.kind === "action";
+const isControl = (el) => CONTROL_KINDS.has(el.kind);
 const controls = () => [...state.els.values()].filter(isControl);
 const siblings = (c) => controls().filter((s) => s.view === c.view);
 const toolbar = (view) => controls().filter((c) => c.view === view).sort((a, b) => a.order - b.order);
@@ -167,6 +139,20 @@ const navFor = (page) => controls().find((c) => c.to === page);
 const displayText = (el) => (el.kind === "box" ? null : el.text ?? navFor(el.page).text);
 const labelOf = (el) => displayText(el) ?? el.desc;
 const cssText = (style) => Object.entries(style).map(([k, v]) => `${k}: ${v}`).join("; ");
+const pageName = (page) => (page === "all" ? "Everywhere" : S().controls.find((c) => c.to === page)?.text ?? page);
+
+function valueText(c) {
+  if (c.kind === "toggle") return c.states ? c.states[c.value ? 1 : 0] : c.value ? "On" : "Off";
+  if (c.kind === "slider" || c.kind === "stepper") return `${+c.value.toFixed(1)}${c.unit}`;
+  return null;
+}
+
+function fmtDuration(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ${s % 60} s`;
+  return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min`;
+}
 
 function log(type, data = {}) {
   // Signals switched off in the setup are not observed at all.
@@ -194,13 +180,25 @@ const box = (id) => {
 const textAttrs = (id) => `${box(id)} data-text="${id}"`;
 const textOf = (id) => esc(displayText(state.els.get(id)));
 
-function button(c, where = "toolbar") {
+function controlHTML(c, where = "toolbar") {
   const cls = ["btn", c.kind, where === "quick" && "quick", c.adapted && "adapted",
-    c.kind === "nav" && c.to === state.view && "current"].filter(Boolean).join(" ");
-  return `<button data-id="${c.id}" data-where="${where}" class="${cls}"${styleAttr(c)}${titleAttr(c)}>${esc(c.text)}</button>`;
+    c.kind === "nav" && c.to === state.view && "current", c.kind === "toggle" && c.value && "on"].filter(Boolean).join(" ");
+  const attrs = `data-id="${c.id}" data-control data-where="${where}" class="${cls}"${styleAttr(c)}${titleAttr(c)}`;
+  const label = esc(c.text);
+  const value = esc(valueText(c) ?? "");
+  switch (c.kind) {
+    case "toggle":
+      return `<button ${attrs} role="switch" aria-checked="${c.value}"><span class="switch" aria-hidden="true"></span><span>${label}</span><span class="state">${value}</span></button>`;
+    case "slider":
+      return `<div ${attrs}><span class="ctl-label">${label}</span><input type="range" data-slider="${c.id}" min="${c.min}" max="${c.max}" step="${c.step}" value="${c.value}" aria-label="${label}"><output class="state">${value}</output></div>`;
+    case "stepper":
+      return `<div ${attrs}><span class="ctl-label">${label}</span><button type="button" data-step="-1" aria-label="Lower ${label}">−</button><output class="state">${value}</output><button type="button" data-step="1" aria-label="Raise ${label}">+</button></div>`;
+    default:
+      return `<button ${attrs}>${label}</button>`;
+  }
 }
 
-const control = (c) => `<div class="ctl">${button(c)}${c.hint ? `<span class="hint" data-text="hint:${c.id}">${esc(c.hint)}</span>` : ""}</div>`;
+const control = (c) => `<div class="ctl">${controlHTML(c)}${c.hint ? `<span class="hint" data-text="hint:${c.id}">${esc(c.hint)}</span>` : ""}</div>`;
 
 // Re-rendering replaces the DOM, which would drop a text selection. Text
 // elements are keyed by data-text, so the selection can be put back.
@@ -241,7 +239,7 @@ function render() {
     <header class="app-top" ${box("header")}>
       <span class="brand" ${textAttrs("brand")}>${textOf("brand")}</span>
       <div class="quick" data-toolbar="quick" ${box("quick")}>
-        ${pinned.length ? `<span class="quick-label" ${textAttrs("quick_label")}>${textOf("quick_label")}</span>${pinned.map((c) => button(c, "quick")).join("")}` : ""}
+        ${pinned.length ? `<span class="quick-label" ${textAttrs("quick_label")}>${textOf("quick_label")}</span>${pinned.map((c) => controlHTML(c, "quick")).join("")}` : ""}
       </div>
     </header>
     <nav class="app-nav" data-toolbar="nav" ${box("sidebar")}>${toolbar("nav").map(control).join("")}</nav>
@@ -249,7 +247,7 @@ function render() {
       <h1 ${textAttrs(`${p}.title`)}>${textOf(`${p}.title`)}</h1>
       <p class="lede" ${textAttrs(`${p}.lede`)}>${textOf(`${p}.lede`)}</p>
       <div class="toolbar" data-toolbar="${p}" ${box(`${p}.toolbar`)}>${toolbar(p).map(control).join("")}</div>
-      <ul class="rows" ${box(`${p}.rows`)}>${PAGES[p].rows.map((_, i) => `<li ${textAttrs(`${p}.row${i}`)}>${textOf(`${p}.row${i}`)}</li>`).join("")}</ul>
+      <ul class="rows" ${box(`${p}.rows`)}>${S().pages[p].rows.map((_, i) => `<li ${textAttrs(`${p}.row${i}`)}>${textOf(`${p}.row${i}`)}</li>`).join("")}</ul>
     </main>`;
 
   const t = now();
@@ -257,7 +255,7 @@ function render() {
     if (until > t) for (const node of document.querySelectorAll(`[data-id="${id}"]`)) node.classList.add("flash");
   }
   restoreSelection(selection);
-  // The popover's wording ("On the … page") and anchor depend on the page shown.
+  // Popover wording ("On the … page") and anchors depend on the page shown.
   renderConfirm();
 }
 
@@ -267,16 +265,20 @@ function toast(msg) {
   el.textContent = msg;
   el.classList.add("show");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove("show"), 1800);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
 }
 
 // ---------- user input ----------
 
 $app.addEventListener("click", (ev) => {
-  const btn = ev.target.closest("button[data-id]");
-  if (!btn) return;
-  const c = state.els.get(btn.dataset.id);
+  const host = ev.target.closest("[data-control]");
+  if (!host) return;
+  const c = state.els.get(host.dataset.id);
   endHover();
+
+  const step = ev.target.closest("[data-step]");
+  if (step) return setValue(c, c.value + Number(step.dataset.step) * c.step);
+  if (c.kind === "slider" || c.kind === "stepper") return; // handled by their own inputs
 
   if (c.kind === "nav") {
     log("nav", { id: c.id, label: c.text, to: c.to });
@@ -284,26 +286,56 @@ $app.addEventListener("click", (ev) => {
     render();
     return;
   }
+  if (c.kind === "toggle") return setValue(c, !c.value);
 
-  log("click", { id: c.id, label: c.text, via: btn.dataset.where });
-  toast(c.desc);
+  log("click", { id: c.id, label: c.text, via: host.dataset.where });
+  if (c.effects) {
+    for (const [id, value] of Object.entries(c.effects)) {
+      const device = state.els.get(id);
+      if (device) device.value = value;
+    }
+    render();
+    toast(`${c.text}: ${c.desc.replace(/^Scene: /, "")}`);
+  } else {
+    toast(c.desc);
+  }
 });
 
-// Hover targets are controls (buttons) and text (data-text).
-const HOVER_TARGET = "button[data-id], [data-text]";
+function setValue(c, raw) {
+  const value = c.kind === "toggle" ? Boolean(raw) : Math.min(c.max, Math.max(c.min, Math.round(raw / c.step) * c.step));
+  if (value === c.value) return;
+  c.value = value;
+  log("set", { id: c.id, label: c.text, value: valueText(c) });
+  render();
+}
+
+// Sliders show their value while dragging and commit on release.
+$app.addEventListener("input", (ev) => {
+  const range = ev.target.closest("[data-slider]");
+  if (!range) return;
+  const c = state.els.get(range.dataset.slider);
+  range.parentElement.querySelector("output").textContent = valueText({ ...c, value: Number(range.value) });
+});
+$app.addEventListener("change", (ev) => {
+  const range = ev.target.closest("[data-slider]");
+  if (range) setValue(state.els.get(range.dataset.slider), Number(range.value));
+});
+
+// Hover targets are controls and text.
+const HOVER_TARGET = "[data-control], [data-text]";
 
 $app.addEventListener("pointerover", (ev) => {
   const el = ev.target.closest(HOVER_TARGET);
-  const isButton = el?.matches("button");
-  const key = el && (isButton ? el.dataset.id : `text:${el.dataset.text}`);
+  const isCtl = el?.hasAttribute("data-control");
+  const key = el && (isCtl ? el.dataset.id : `text:${el.dataset.text}`);
   if (key === state.hover?.key) return;
   endHover();
   if (el) {
     state.hover = {
       key,
-      control: isButton,
-      id: isButton ? el.dataset.id : el.dataset.text,
-      text: isButton ? null : el.textContent.trim().slice(0, 80),
+      control: isCtl,
+      id: isCtl ? el.dataset.id : el.dataset.text,
+      text: isCtl ? null : el.textContent.trim().slice(0, 80),
       t: now(),
       dwellChecked: false,
       hesitated: false,
@@ -349,19 +381,33 @@ function logSelection() {
   log("select", { id, text: text.slice(0, 80) });
 }
 
+// Right-click (or long-press) any element to ask for a change to it.
+$app.addEventListener("contextmenu", (ev) => {
+  if (!canRequest()) return;
+  const el = ev.target.closest("[data-id]");
+  if (!el) return;
+  ev.preventDefault();
+  endHover();
+  openRequest(el.dataset.id);
+});
+
 $app.addEventListener("pointerup", () => setTimeout(logSelection, 0));
 $app.addEventListener("pointerenter", () => Object.assign(state.pointer, { inApp: true, enteredApp: now() }));
 $app.addEventListener("pointerleave", () => { state.pointer.inApp = false; endHover(); });
 document.addEventListener("pointermove", (ev) => Object.assign(state.pointer, { x: ev.clientX, y: ev.clientY }));
 document.addEventListener("pointerdown", () => (state.pointer.down = true));
-document.addEventListener("pointerup", () => (state.pointer.down = false));
+document.addEventListener("pointerup", () => {
+  state.pointer.down = false;
+  // Dragging a slider isn't hesitating: restart the dwell clock on release.
+  if (state.hover) state.hover.t = now();
+});
 document.documentElement.addEventListener("pointerleave", () => Object.assign(state.pointer, { x: -1, y: -1 }));
 
 // Hesitation is logged while it happens, so the adapter can react before the
 // person gives up and moves on.
 function detectHesitation(t) {
   const h = state.hover;
-  if (h?.control && !h.dwellChecked && t - h.t >= state.config.hesitateMs) {
+  if (h?.control && !h.dwellChecked && !state.pointer.down && t - h.t >= state.config.hesitateMs) {
     h.dwellChecked = true;
     const c = state.els.get(h.id);
     h.hesitated = Boolean(log("hesitate", { id: c.id, label: c.text, ms: t - h.t }));
@@ -383,7 +429,7 @@ function buildContext() {
     const s = stats.get(e.id) ?? { hoverMs: 0, hesitations: 0, clicks: 0 };
     if (e.type === "hover") s.hoverMs += e.ms;
     else if (e.type === "hesitate") { s.hoverMs += e.ms; s.hesitations++; }
-    else if (e.type === "click" || e.type === "nav") s.clicks++;
+    else if (e.type === "click" || e.type === "set" || e.type === "nav") s.clicks++;
     stats.set(e.id, s);
   }
   // Global elements, the current page's texts and containers, and every control.
@@ -391,20 +437,23 @@ function buildContext() {
   const ids = [
     ...GLOBALS.map((g) => g.id),
     `${p}.title`, `${p}.lede`, `${p}.toolbar`, `${p}.rows`,
-    ...PAGES[p].rows.map((_, i) => `${p}.row${i}`),
-    ...["nav", ...Object.keys(PAGES)].flatMap((v) => toolbar(v).map((c) => c.id)),
+    ...S().pages[p].rows.map((_, i) => `${p}.row${i}`),
+    ...["nav", ...Object.keys(S().pages)].flatMap((v) => toolbar(v).map((c) => c.id)),
   ];
   const elements = ids.map((id) => {
     const el = state.els.get(id);
     return {
-      id, kind: el.kind, page: el.page, text: displayText(el), desc: el.desc, css: cssText(el.style),
+      id, kind: el.kind, page: el.page, text: displayText(el), desc: el.desc, value: valueText(el), css: cssText(el.style),
       pinned: el.pinned, hint: el.hint,
       // Locked elements are hidden from the model and from its output schema.
       locked: el.frozen || el.changeCount >= level().perControl,
       hoverMs: 0, hesitations: 0, clicks: 0, ...stats.get(id),
     };
   });
-  return { level: level(), config: state.config, view: p, elements, recent: recent.slice(-20) };
+  return {
+    level: level(), config: state.config, about: S().about, view: p, elements,
+    recent: recent.slice(-20), preferences: state.preferences.slice(-6),
+  };
 }
 
 async function runRound() {
@@ -412,7 +461,7 @@ async function runRound() {
   const ctx = buildContext();
   state.windowStart = state.events.length;
   const t0 = now();
-  const round = { at: t0, engine: state.engineKey, intensity: state.intensity, configVersion: state.configVersion, attempts: 0, raw: [], accepted: [], rejected: [] };
+  const round = { at: t0, kind: "adapt", engine: state.engineKey, intensity: state.intensity, configVersion: state.configVersion, attempts: 0, raw: [], accepted: [], rejected: [] };
   try {
     // At "Max" a round must change something: if every proposal is rejected,
     // ask once more, telling the model why.
@@ -438,19 +487,26 @@ async function runRound() {
   } catch (err) {
     round.error = String(err?.message ?? err);
   } finally {
-    round.latencyMs = now() - t0;
-    state.rounds.push(round);
-    log("round", { engine: round.engine, latencyMs: round.latencyMs, attempts: round.attempts, accepted: round.accepted.length, rejected: round.rejected.length, error: round.error });
-    state.busy = false;
-    state.lastRound = now();
-    // Actions that arrived while the model was busy get their own round.
-    setTimeout(maybeRunRound, 0);
+    finishRound(round, t0);
   }
 }
 
+function finishRound(round, t0) {
+  round.latencyMs = now() - t0;
+  state.rounds.push(round);
+  log("round", { kind: round.kind, engine: round.engine, latencyMs: round.latencyMs, attempts: round.attempts, accepted: round.accepted.length, rejected: round.rejected.length, error: round.error });
+  state.busy = false;
+  state.lastRound = now();
+  // Anything that arrived while the model was busy gets its own round.
+  setTimeout(maybeRunRound, 0);
+}
+
 function maybeRunRound() {
-  if (!state.everStarted || state.setupOpen || state.modalOpen) return;
-  if (!state.adaptive || !state.engine || state.busy || state.loading) return;
+  if (!state.everStarted || state.setupOpen || state.modalOpen || state.ended) return;
+  if (!state.engine || state.busy || state.loading) return;
+  // The person's own requests come first and work even with adaptation off.
+  if (state.requests.length) return runRequest(state.requests.shift());
+  if (!state.adaptive) return;
   const lvl = level();
   const fresh = state.events.slice(state.windowStart);
   const t = now();
@@ -479,14 +535,18 @@ function parseDeclarations(text) {
   return decls.length ? decls : "no CSS declarations";
 }
 
-function validate(ch) {
+// Explicit requests skip the soft limits (locks, caps, earlier declines) but
+// never the checks that keep a change valid and safe.
+function validate(ch, { explicit = false } = {}) {
   const el = state.els.get(ch?.id);
   if (!el) return "unknown element";
   if (!state.config.ops.includes(ch.op)) return "change type turned off";
-  if (el.frozen) return "locked after undo";
-  if (el.changeCount >= level().perControl) return "changed too often";
   const text = typeof ch.text === "string" ? ch.text.trim() : "";
-  if (state.declined.has(proposalKey(ch))) return "the person declined this exact change";
+  if (!explicit) {
+    if (el.frozen) return "locked after undo";
+    if (el.changeCount >= level().perControl) return "changed too often";
+    if (state.declined.has(proposalKey(ch))) return "the person declined this exact change";
+  }
   switch (ch.op) {
     case "text": {
       if (el.kind === "box") return "this element has no text";
@@ -511,13 +571,130 @@ function validate(ch) {
       if (el.order === Math.min(...siblings(el).map((s) => s.order))) return "already first";
       return null;
     case "pin":
-      if (el.kind !== "action") return "only actions can be pinned";
+      if (!PINNABLE.has(el.kind)) return "only actions and switches can be pinned";
       if (el.pinned) return "already pinned";
       if (controls().filter((s) => s.pinned).length >= MAX_PINS) return "quick bar full";
       return null;
     default:
       return "unknown op";
   }
+}
+
+// ---------- requests: the person asks for a change ----------
+
+const canRequest = () => Boolean(state.engine) && state.everStarted && !state.setupOpen && !state.modalOpen && !state.ended;
+
+function openRequest(id) {
+  const el = state.els.get(id);
+  state.request = { id, req: null };
+  const value = valueText(el);
+  $("request-target").textContent = `${labelOf(el)}${value ? ` · ${value}` : ""}`;
+  $("request-input").value = "";
+  $("request-form").hidden = false;
+  $("request-result").hidden = true;
+  $("request").hidden = false;
+  renderConfirm();
+  $("request-input").focus();
+}
+
+function closeRequest() {
+  state.request = null;
+  $("request").hidden = true;
+  renderConfirm();
+}
+
+function submitRequest(req) {
+  if (!canRequest()) return;
+  req.phase = "working";
+  req.changes = [];
+  if (req.ui === "popover" && state.request) state.request.req = req;
+  else state.barRequest = req;
+  state.preferences.push({ text: req.text, id: req.id });
+  log("request", { id: req.id, text: req.text, via: req.ui });
+  state.requests.push(req);
+  renderRequestFeedback(req);
+  maybeRunRound();
+}
+
+async function runRequest(req) {
+  state.busy = true;
+  state.requestBusy = true;
+  // A direct request can touch anything, including locked elements.
+  const base = buildContext();
+  const ctx = { ...base, elements: base.elements.map((e) => ({ ...e, locked: false })), request: { text: req.text, id: req.id } };
+  const t0 = now();
+  const round = { at: t0, kind: "request", request: req.text, target: req.id, engine: state.engineKey, configVersion: state.configVersion, attempts: 0, raw: [], accepted: [], rejected: [] };
+  let reply = "";
+  let modelDeclined = false;
+  try {
+    while (round.attempts < 2 && !req.changes.length) {
+      round.attempts++;
+      const res = await state.engine.propose({ ...ctx, rejected: round.rejected });
+      round.raw.push(res.raw);
+      round.usage = res.usage;
+      reply = res.reply;
+      modelDeclined = !res.changes.length;
+      for (const ch of res.changes) {
+        const why = validate(ch, { explicit: true });
+        if (why) {
+          round.rejected.push({ ...ch, why });
+        } else {
+          round.accepted.push(ch);
+          req.changes.push(apply(ch, { requested: req.text }).n);
+        }
+      }
+      // An empty answer is the model saying it can't; its reply says why.
+      if (modelDeclined) break;
+    }
+    if (req.changes.length) {
+      render();
+      renderChanges();
+      req.reply = reply || "Done.";
+    } else if (modelDeclined) {
+      req.reply = reply || "I couldn't do that.";
+    } else {
+      req.reply = `I couldn't do that: ${round.rejected.at(-1)?.why ?? "no valid change"}.`;
+    }
+  } catch (err) {
+    round.error = String(err?.message ?? err);
+    req.reply = "Something went wrong. Try again.";
+  } finally {
+    req.phase = "done";
+    state.requestBusy = false;
+    renderRequestFeedback(req);
+    finishRound(round, t0);
+  }
+}
+
+function renderRequestFeedback(req) {
+  const working = req.phase === "working";
+  const message = working ? "Working on it…" : req.reply;
+  const canUndo = !working && req.changes.length > 0 && !req.undone;
+  if (req.ui === "popover") {
+    if (state.request?.req !== req) {
+      // The popover was closed meanwhile; say it where it can still be seen.
+      if (!working) toast(message);
+      return;
+    }
+    $("request-form").hidden = true;
+    $("request-result").hidden = false;
+    $("request-reply").textContent = message;
+    $("request-undo").hidden = !canUndo;
+    $("request-ok").hidden = working;
+    renderConfirm();
+  } else if (state.barRequest === req) {
+    $("ask-status").hidden = false;
+    $("ask-reply").textContent = message;
+    $("ask-undo").hidden = !canUndo;
+  }
+}
+
+function undoRequest(req) {
+  if (!req || req.undone) return;
+  for (const n of req.changes) undo(n);
+  req.undone = true;
+  req.reply = "Undone.";
+  renderRequestFeedback(req);
 }
 
 // ---------- confirming changes ----------
@@ -559,6 +736,18 @@ function decide(accepted) {
   renderConfirm();
 }
 
+function changeText(e) {
+  const label = esc(e.label);
+  const text = esc(e.text);
+  return {
+    text: `Changed “${label}” → “${text}”`,
+    style: `Restyled “${label}”: <code>${text}</code>`,
+    hint: `Hint on “${label}”: ${text}`,
+    move_first: `Moved “${label}” first`,
+    pin: `Pinned “${label}” to Quick actions`,
+  }[e.op];
+}
+
 function describeProposal(ch) {
   const el = state.els.get(ch.id);
   const label = esc(labelOf(el));
@@ -574,7 +763,7 @@ function describeProposal(ch) {
   return where + what + (ch.op === "style" ? `<code>${text}</code>` : "");
 }
 
-// The element a proposal points at: the element itself if it's on screen,
+// The element a popover points at: the element itself if it's on screen,
 // otherwise the nav item of its page, otherwise the top bar.
 function anchorFor(el) {
   if (el.id === "app") return $app;
@@ -585,21 +774,27 @@ function anchorFor(el) {
 
 function renderConfirm() {
   const ch = state.proposals[0];
-  const show = Boolean(ch) && !state.setupOpen && !state.modalOpen;
+  // A suggestion waits while the person is writing their own request.
+  const show = Boolean(ch) && !state.setupOpen && !state.modalOpen && !state.ended && !state.request;
   $("confirm").hidden = !show;
-  if (!show) return;
-  $("confirm-what").innerHTML = describeProposal(ch);
-  $("confirm-why").textContent = ch.reason || "";
-  $("confirm-more").textContent = state.proposals.length > 1 ? `+${state.proposals.length - 1} more` : "";
-  positionConfirm();
+  if (show) {
+    $("confirm-what").innerHTML = describeProposal(ch);
+    $("confirm-why").textContent = ch.reason || "";
+    $("confirm-more").textContent = state.proposals.length > 1 ? `+${state.proposals.length - 1} more` : "";
+  }
+  positionPopovers();
   renderStatus();
 }
 
-function positionConfirm() {
-  const pop = $("confirm");
+function positionPopovers() {
   const ch = state.proposals[0];
-  if (pop.hidden || !ch) return;
-  const anchor = anchorFor(state.els.get(ch.id)).getBoundingClientRect();
+  if (ch && !$("confirm").hidden) positionPopover($("confirm"), anchorFor(state.els.get(ch.id)));
+  if (state.request) positionPopover($("request"), anchorFor(state.els.get(state.request.id)));
+}
+
+function positionPopover(pop, anchorNode) {
+  if (pop.hidden || !anchorNode) return;
+  const anchor = anchorNode.getBoundingClientRect();
   const stage = document.querySelector(".stage").getBoundingClientRect();
   const w = pop.offsetWidth;
   const h = pop.offsetHeight;
@@ -651,7 +846,7 @@ function flushPending() {
   renderChanges();
 }
 
-function apply(ch, { confirmed = false } = {}) {
+function apply(ch, { confirmed = false, requested = null } = {}) {
   const el = state.els.get(ch.id);
   const text = (ch.text ?? "").trim();
   const label = labelOf(el);
@@ -675,11 +870,15 @@ function apply(ch, { confirmed = false } = {}) {
   }
   el.changeCount++;
   el.adapted = true;
-  el.adaptReason = ch.reason || ch.op;
+  el.adaptReason = requested ? `You asked: ${requested}` : ch.reason || ch.op;
   state.flashUntil.set(el.id, now() + 1600);
-  const entry = { n: state.changes.length + 1, op: ch.op, id: el.id, text, reason: ch.reason ?? "", label, before, engine: state.engineKey, configVersion: state.configVersion, confirmed, undone: false };
+  const entry = {
+    n: state.changes.length + 1, op: ch.op, id: el.id, page: el.page, text, reason: ch.reason ?? "", label, before,
+    engine: state.engineKey, configVersion: state.configVersion, confirmed, requested, undone: false,
+  };
   state.changes.push(entry);
-  log("change", { n: entry.n, op: ch.op, id: el.id, text, reason: entry.reason });
+  log("change", { n: entry.n, op: ch.op, id: el.id, text, reason: entry.reason, requested });
+  return entry;
 }
 
 function undo(n) {
@@ -706,34 +905,128 @@ function undo(n) {
 // Back to the original app as if it were a fresh visit. Unlike undo, nothing
 // is locked and nothing is recorded as a rejection; the adapter just stops
 // seeing earlier activity. The export log is kept.
-function startOver() {
+function resetSession() {
   endHover();
   seed();
-  state.view = "home";
+  state.view = firstPage();
   state.changes = [];
   state.pending = [];
   state.proposals = [];
+  state.requests = [];
+  state.preferences = [];
   state.declined.clear();
   state.flashUntil.clear();
   state.pageHesitated = false;
   state.lastSelection = "";
+  state.ended = false;
+  state.sessionBeganAt = 0;
+  state.endedAt = 0;
+  state.barRequest = null;
+  $("ask-status").hidden = true;
   getSelection().removeAllRanges();
-  log("start_over");
+  closeRequest();
+  log("start_over", { scenario: state.scenario });
   state.sessionStart = state.windowStart = state.events.length;
   state.lastActivity = now();
   render();
   renderChanges();
-  renderConfirm();
+  renderStage();
+}
+
+function startOver() {
+  resetSession();
   // A fresh visit is a new session, so it gets the training-mode notice too.
   if (!state.setupOpen) showWelcome();
 }
 
+// ---------- ending a session ----------
+
+function endSession() {
+  if (!state.everStarted) return;
+  if (state.ended) return openSummary();
+  state.ended = true;
+  state.endedAt = now();
+  endHover();
+  for (const ch of state.proposals) log("expired", { op: ch.op, id: ch.id, text: ch.text });
+  state.proposals = [];
+  state.pending = [];
+  state.requests = [];
+  closeRequest();
+  const summary = summarize();
+  log("session_end", summary);
+  renderStage();
+  openSummary();
+}
+
+function summarize() {
+  const events = state.events.slice(state.sessionStart);
+  const count = (type, pred = () => true) => events.filter((e) => e.type === type && pred(e)).length;
+  const rounds = state.rounds.filter((r) => r.at >= (state.sessionBeganAt || 0));
+  const kept = state.changes.filter((c) => !c.undone);
+  return {
+    durationMs: (state.endedAt || now()) - (state.sessionBeganAt || state.endedAt || now()),
+    changes: state.changes.length,
+    kept: kept.length,
+    undone: state.changes.length - kept.length,
+    requests: count("request"),
+    requestedChanges: state.changes.filter((c) => c.requested).length,
+    suggestedChanges: kept.filter((c) => !c.requested).length,
+    accepted: count("decision", (e) => e.accepted),
+    declined: count("decision", (e) => !e.accepted),
+    expired: count("expired"),
+    actions: count("click") + count("set"),
+    pages: count("nav"),
+    hesitations: count("hesitate"),
+    selections: count("select"),
+    rounds: rounds.length,
+    avgLatencyMs: rounds.length ? Math.round(rounds.reduce((sum, r) => sum + r.latencyMs, 0) / rounds.length) : 0,
+  };
+}
+
+function openSummary() {
+  const s = summarize();
+  $("summary-title").textContent = `How the ${S().noun} adapted to you`;
+  const tile = (value, label, sub = "") => `<div class="tile"><span class="tile-value">${esc(value)}</span><span class="tile-label">${esc(label)}</span>${sub ? `<span class="tile-sub">${esc(sub)}</span>` : ""}</div>`;
+  const offered = s.accepted + s.declined + s.expired;
+  $("summary-tiles").innerHTML = [
+    tile(fmtDuration(s.durationMs), "Session length"),
+    tile(String(s.kept), s.kept === 1 ? "Change kept" : "Changes kept", s.undone ? `${s.undone} undone` : ""),
+    tile(String(s.requests), s.requests === 1 ? "Request from you" : "Requests from you", s.requests ? `${s.requestedChanges} changes made` : ""),
+    offered
+      ? tile(`${s.accepted}/${offered}`, "Suggestions accepted", [s.declined && `${s.declined} declined`, s.expired && `${s.expired} expired`].filter(Boolean).join(", "))
+      : tile(String(s.suggestedChanges), "Suggested changes", "applied without asking"),
+  ].join("");
+
+  const times = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+  $("summary-activity").textContent =
+    `You clicked or adjusted things ${times(s.actions, "time", "times")}, changed pages ${times(s.pages, "time", "times")}, ` +
+    `hesitated ${times(s.hesitations, "time", "times")} and selected text ${times(s.selections, "time", "times")}. ` +
+    `The model ran ${times(s.rounds, "round", "rounds")}${s.rounds ? `, ${(s.avgLatencyMs / 1000).toFixed(1)} s each on average` : ""}.`;
+
+  // Every change, grouped by the page it is on; "Everywhere" for shared parts.
+  const groups = new Map();
+  for (const c of state.changes) groups.set(c.page, [...(groups.get(c.page) ?? []), c]);
+  const order = ["all", ...Object.keys(S().pages)];
+  $("summary-changes").innerHTML = state.changes.length
+    ? order.filter((p) => groups.has(p)).map((p) => `
+        <section>
+          <h4>${esc(pageName(p))}</h4>
+          <ul>${groups.get(p).map((c) => {
+            const tags = [c.requested && "you asked", c.confirmed && "you accepted", c.undone && "undone"].filter(Boolean);
+            return `<li class="${c.undone ? "undone" : ""}">${changeText(c)}${tags.map((t) => ` <span class="tag">${t}</span>`).join("")}</li>`;
+          }).join("")}</ul>
+        </section>`).join("")
+    : `<p class="welcome-small">Nothing changed this session.</p>`;
+
+  $("summary").showModal();
+}
+
 function tick() {
-  if (!state.setupOpen && !state.modalOpen) {
+  if (!state.setupOpen && !state.modalOpen && !state.ended) {
     detectHesitation(now());
     flushPending();
-    maybeRunRound();
   }
+  maybeRunRound();
   renderStatus();
 }
 
@@ -744,6 +1037,7 @@ const chip = (kind, key, label, on) =>
 
 function openSetup() {
   endHover();
+  closeRequest();
   state.setupOpen = true;
   state.draft = structuredClone(state.config);
   fillSetup();
@@ -752,6 +1046,9 @@ function openSetup() {
 
 function fillSetup() {
   const d = state.draft;
+  $("scenarios").innerHTML = Object.entries(SCENARIOS).map(([k, s]) =>
+    `<label class="chip"><input type="radio" name="scenario" value="${k}" ${d.scenario === k ? "checked" : ""}> ${esc(s.label)}</label>`
+  ).join("");
   $("prompt").value = d.prompt;
   $("ops").innerHTML = Object.entries(OP_LABELS).map(([k, l]) => chip("op", k, l, d.ops.includes(k))).join("");
   $("signals").innerHTML = Object.entries(SIGNALS).map(([k, l]) => chip("signal", k, l, d.signals.includes(k))).join("");
@@ -768,6 +1065,7 @@ function readSetup() {
     const v = parseFloat($(id).value);
     return Math.round((Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : fallback) * 1000);
   };
+  d.scenario = $("scenarios").querySelector("input:checked")?.value ?? DEFAULT_SCENARIO;
   d.prompt = $("prompt").value;
   d.ops = [...$("ops").querySelectorAll("input:checked")].map((i) => i.dataset.op);
   d.signals = [...$("signals").querySelectorAll("input:checked")].map((i) => i.dataset.signal);
@@ -792,9 +1090,10 @@ function renderSetup() {
     : !d.ops.length ? "Allow at least one kind of change."
     : !d.prompt.trim() ? "The prompt can't be empty."
     : "";
+  const switching = state.everStarted && d.scenario !== state.scenario;
   $("start").disabled = Boolean(problem);
   $("start").textContent = state.everStarted ? "Apply and return" : "Start";
-  $("start-note").textContent = problem;
+  $("start-note").textContent = problem || (switching ? "Switching apps starts a new session." : "");
   $("setup-cancel").hidden = !state.everStarted;
 }
 
@@ -827,26 +1126,36 @@ function start() {
   const changed = JSON.stringify(state.draft) !== JSON.stringify(state.config);
   state.config = state.draft;
   state.draft = null;
-  if (changed || !state.everStarted) {
+  if (changed || firstStart) {
     state.configVersion++;
     log("config", { version: state.configVersion, ...state.config });
   }
   state.setupOpen = false;
   state.everStarted = true;
+  const switching = state.config.scenario !== state.scenario;
+  if (switching) {
+    state.scenario = state.config.scenario;
+    resetSession();
+  }
   // Don't react to anything from before (re)starting.
   state.windowStart = state.events.length;
   state.lastActivity = now();
   renderStage();
-  if (firstStart) showWelcome();
+  if (firstStart || switching) showWelcome();
 }
 
 function renderStage() {
   $("setup").hidden = !state.setupOpen;
-  $("app-wrap").hidden = state.setupOpen;
+  $("session").hidden = state.setupOpen;
   $("edit-setup").disabled = state.setupOpen;
+  $("end-session").disabled = !state.everStarted || state.setupOpen;
+  $("end-session").textContent = state.ended ? "Show summary" : "End session";
+  $("ask-input").disabled = state.ended;
+  $("ask-input").placeholder = state.ended
+    ? "The session has ended."
+    : `Ask the ${S().noun} to change something, or right-click any part of it…`;
   if (!state.setupOpen) render();
   renderConfirm();
-  renderStatus();
 }
 
 // ---------- control panel ----------
@@ -858,8 +1167,10 @@ function renderStatus() {
     else if (!state.engine) s = "Step 1: pick a model.";
     else if (!state.everStarted) s = "Step 2: edit the prompt if you like, then click Start.";
     else if (state.setupOpen) s = "Paused while you edit the setup.";
+    else if (state.ended) s = "Session ended. The app keeps its changes; Start over begins a new session.";
     else if (state.modalOpen) s = "Waiting for the training-mode notice to be closed.";
-    else if (!state.adaptive) s = "Adaptation is off. Activity is still logged.";
+    else if (state.requestBusy || state.requests.length) s = "Working on your request…";
+    else if (!state.adaptive) s = "Adaptation is off. Requests still work; activity is still logged.";
     else if (state.proposals.length) s = `${state.proposals.length} change(s) waiting for your confirmation.`;
     else if (state.busy) s = "Thinking…";
     else if (state.pending.length) s = `${state.pending.length} change(s) waiting for the pointer to move away.`;
@@ -873,15 +1184,9 @@ function renderStatus() {
 function renderChanges() {
   $("changes").innerHTML = state.changes.length
     ? state.changes.slice().reverse().map((e) => {
-        const what = {
-          text: `Changed “${esc(e.label)}” → “${esc(e.text)}”`,
-          style: `Restyled “${esc(e.label)}”: <code>${esc(e.text)}</code>`,
-          hint: `Hint on “${esc(e.label)}”: ${esc(e.text)}`,
-          move_first: `Moved “${esc(e.label)}” first`,
-          pin: `Pinned “${esc(e.label)}” to Quick actions`,
-        }[e.op];
         const undoBtn = e.undone ? "" : `<button data-undo="${e.n}">Undo</button>`;
-        return `<li class="${e.undone ? "undone" : ""}">${what}${undoBtn}<span class="why">${esc(e.reason)}</span></li>`;
+        const why = e.requested ? `You asked: “${esc(e.requested)}”` : esc(e.reason);
+        return `<li class="${e.undone ? "undone" : ""}">${changeText(e)}${undoBtn}<span class="why">${why}</span></li>`;
       }).join("")
     : `<li class="empty">No changes yet.</li>`;
 }
@@ -889,12 +1194,14 @@ function renderChanges() {
 function renderActivity() {
   const items = state.events.slice(-14).reverse().map((e) => {
     const text = CONTEXT_EVENTS.has(e.type) ? describeEvent(e)
+      : e.type === "change" ? `change #${e.n}: ${e.op} ${e.id}${e.requested ? " (requested)" : ""}`
+      : e.type === "round" ? `${e.kind === "request" ? "request round" : "round"}: ${e.accepted} accepted, ${e.rejected} rejected${e.attempts > 1 ? `, ${e.attempts} tries` : ""} (${e.latencyMs} ms)${e.error ? `. Error: ${e.error}` : ""}`
       : e.type === "expired" ? `unanswered change expired: ${e.op} ${e.id}`
       : e.type === "ask_first" ? `ask before each change: ${e.on ? "on" : "off"}`
       : e.type === "welcome_closed" ? "training-mode notice closed"
-      : e.type === "change" ? `change #${e.n}: ${e.op} ${e.id}`
-      : e.type === "round" ? `round: ${e.accepted} accepted, ${e.rejected} rejected${e.attempts > 1 ? `, ${e.attempts} tries` : ""} (${e.latencyMs} ms)${e.error ? `. Error: ${e.error}` : ""}`
-      : e.type === "start_over" ? "started over"
+      : e.type === "session_end" ? `session ended after ${fmtDuration(e.durationMs)}`
+      : e.type === "session_resume" ? "session resumed"
+      : e.type === "start_over" ? `started over (${SCENARIOS[e.scenario]?.label ?? e.scenario})`
       : e.type === "intensity" ? `intensity: ${INTENSITIES[e.level].label}`
       : e.type === "config" ? `prompt and settings v${e.version}`
       : e.type === "engine" ? `model: ${ENGINES[e.engine].label}`
@@ -961,20 +1268,64 @@ function setupControls() {
     // Turning it off hands any waiting proposals to the normal apply path.
     if (!state.askFirst) state.pending.push(...state.proposals.splice(0));
     renderConfirm();
-    renderStatus();
   });
   $("confirm-yes").addEventListener("click", () => decide(true));
   $("confirm-no").addEventListener("click", () => decide(false));
-  window.addEventListener("resize", positionConfirm);
-  window.addEventListener("scroll", positionConfirm, { passive: true });
 
-  // Closing the notice (button or Escape) resumes adaptation.
+  // Requests: the ask bar above the app and the "Change this" popover.
+  $("ask").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const text = $("ask-input").value.trim();
+    if (!text) return;
+    $("ask-input").value = "";
+    submitRequest({ id: null, text, ui: "bar" });
+  });
+  $("ask-undo").addEventListener("click", () => undoRequest(state.barRequest));
+  $("request-form").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const text = $("request-input").value.trim();
+    if (!text || !state.request) return;
+    submitRequest({ id: state.request.id, text, ui: "popover" });
+  });
+  $("request-cancel").addEventListener("click", closeRequest);
+  $("request-ok").addEventListener("click", closeRequest);
+  $("request-undo").addEventListener("click", () => undoRequest(state.request?.req));
+  // Clicking elsewhere closes the popover; a reply that arrives later shows as a toast.
+  document.addEventListener("pointerdown", (ev) => {
+    if (state.request && !$("request").contains(ev.target)) closeRequest();
+  }, true);
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && state.request) closeRequest();
+    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k" && canRequest()) {
+      ev.preventDefault();
+      $("ask-input").focus();
+    }
+  });
+  window.addEventListener("resize", positionPopovers);
+  window.addEventListener("scroll", positionPopovers, { passive: true });
+
+  // Closing the notice (button or Escape) starts the session clock and adaptation.
   $("welcome").addEventListener("close", () => {
     state.modalOpen = false;
+    if (!state.sessionBeganAt) state.sessionBeganAt = now();
     state.lastActivity = now();
     log("welcome_closed");
     renderConfirm();
-    renderStatus();
+  });
+
+  // Session summary.
+  $("end-session").addEventListener("click", endSession);
+  $("summary-new").addEventListener("click", () => {
+    $("summary").close();
+    startOver();
+  });
+  $("summary-keep").addEventListener("click", () => $("summary").close());
+  $("summary-export").addEventListener("click", exportLog);
+  $("summary-resume").addEventListener("click", () => {
+    $("summary").close();
+    state.ended = false;
+    log("session_resume");
+    renderStage();
   });
 
   document.querySelector(".panel").addEventListener("click", (ev) => {
@@ -991,7 +1342,7 @@ function exportLog() {
     ...state.events.map((e) => ({ kind: "event", ...e })),
     ...state.changes.map(({ before, ...e }) => ({ kind: "change", ...e })),
     ...state.rounds.map((r) => ({ kind: "round", ...r })),
-    { kind: "ui", elements: [...state.els.values()] },
+    { kind: "ui", scenario: state.scenario, elements: [...state.els.values()] },
   ].map((x) => JSON.stringify(x));
   const url = URL.createObjectURL(new Blob([lines.join("\n") + "\n"], { type: "application/x-ndjson" }));
   const a = Object.assign(document.createElement("a"), { href: url, download: `living-house-${Date.now()}.jsonl` });
@@ -1002,8 +1353,10 @@ function exportLog() {
 // ---------- boot ----------
 
 seed();
+state.view = firstPage();
 setupControls();
 openSetup();
+render();
 renderChanges();
 renderActivity();
 setInterval(tick, 300);

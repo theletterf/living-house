@@ -82,7 +82,7 @@ button, select {
 
 .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; margin-bottom: 24px; }
 
-.ctl { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; max-width: 200px; }
+.ctl { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; max-width: 240px; }
 .app-nav .ctl { max-width: none; }
 .hint { font-size: 12px; color: var(--muted); line-height: 1.3; }
 
@@ -121,10 +121,38 @@ button, select {
   100% { box-shadow: 0 0 0 0 transparent; }
 }
 
+/* device controls: switches, sliders, steppers */
+.btn.toggle { display: inline-flex; align-items: center; gap: 9px; }
+.switch {
+  position: relative; flex: none;
+  width: 30px; height: 18px; border-radius: 999px;
+  background: var(--line); transition: background 0.15s;
+}
+.switch::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--surface); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  transition: transform 0.15s;
+}
+.btn.toggle.on .switch { background: var(--accent); }
+.btn.toggle.on .switch::after { transform: translateX(12px); }
+.state { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.btn.slider, .btn.stepper { cursor: default; }
+.btn.slider { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; align-items: center; min-width: 210px; }
+.btn.slider input { grid-column: 1 / -1; grid-row: 2; width: 100%; accent-color: var(--accent); margin: 0; }
+.btn.stepper { display: inline-flex; align-items: center; gap: 8px; }
+.btn.stepper .ctl-label { margin-right: 4px; }
+.btn.stepper button {
+  width: 26px; height: 26px; border-radius: 50%;
+  border: 1px solid var(--line); background: var(--surface-2);
+  cursor: pointer; line-height: 1; padding: 0;
+}
+.btn.stepper output { min-width: 52px; text-align: center; font-size: 14px; color: var(--ink); }
+
 .rows { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
 .rows li { padding: 12px 0; border-bottom: 1px solid var(--line); color: var(--muted); }
 
-#app-wrap[hidden], .setup[hidden] { display: none; }
+#session[hidden], .setup[hidden] { display: none; }
 /* Keeps any z-index the model sets on app elements below the confirmation popover. */
 #app-wrap { position: relative; z-index: 0; isolation: isolate; }
 
@@ -213,9 +241,9 @@ button.link { border: 0; background: none; padding: 4px 0; color: var(--accent);
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
-/* ---------- confirmation popover ---------- */
+/* ---------- popovers: suggested change, "Change this" ---------- */
 
-.confirm {
+.popover {
   position: absolute;
   z-index: 10;
   width: 300px;
@@ -228,13 +256,13 @@ button.link { border: 0; background: none; padding: 4px 0; color: var(--accent);
   font-size: 14px;
   animation: confirm-in 0.18s ease-out;
 }
-.confirm[hidden] { display: none; }
+.popover[hidden] { display: none; }
 @keyframes confirm-in {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: none; }
 }
 /* a small arrow pointing at the element the change is about */
-.confirm::before {
+.popover::before {
   content: "";
   position: absolute;
   left: calc(var(--arrow-x, 50%) - 6px);
@@ -244,11 +272,11 @@ button.link { border: 0; background: none; padding: 4px 0; color: var(--accent);
   border: 1px solid var(--line);
   transform: rotate(45deg);
 }
-.confirm[data-side="below"]::before { top: -6px; border-right: 0; border-bottom: 0; }
-.confirm[data-side="above"]::before { bottom: -6px; border-left: 0; border-top: 0; }
-.confirm[data-side="inside"]::before { display: none; }
+.popover[data-side="below"]::before { top: -6px; border-right: 0; border-bottom: 0; }
+.popover[data-side="above"]::before { bottom: -6px; border-left: 0; border-top: 0; }
+.popover[data-side="inside"]::before { display: none; }
 
-.confirm p { margin: 0; }
+.popover p { margin: 0; }
 .confirm-kicker { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); font-weight: 600; margin-bottom: 4px !important; }
 .confirm-what { line-height: 1.4; }
 .confirm-what code {
@@ -263,6 +291,40 @@ button.link { border: 0; background: none; padding: 4px 0; color: var(--accent);
 .confirm-yes { border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink); font-weight: 600; }
 .confirm-no { border: 1px solid var(--line); background: var(--surface); }
 .confirm-more { margin-left: auto; font-size: 12px; color: var(--muted); }
+
+.request-target { font-weight: 600; margin-bottom: 8px !important; }
+#request-form input {
+  width: 100%; font: inherit; font-size: 14px;
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+}
+#request-form input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+#request-result[hidden], #request-form[hidden] { display: none; }
+
+/* ---------- ask bar (above the app, out of the model's reach) ---------- */
+
+.ask {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  padding: 6px 6px 6px 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.ask:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.ask-icon { color: var(--accent); }
+.ask input { flex: 1; min-width: 0; border: 0; outline: 0; font: inherit; font-size: 15px; background: transparent; }
+.ask-kbd { font: 11px ui-monospace, monospace; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+.ask button {
+  border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink);
+  border-radius: 8px; padding: 6px 14px; font-weight: 600; cursor: pointer;
+}
+.ask-status { margin: 0 0 8px 14px; font-size: 13px; color: var(--muted); }
+.ask-status[hidden], .ask-status button[hidden] { display: none; }
+.ask-status button { margin-left: 8px; }
 
 /* ---------- training-mode notice ---------- */
 
@@ -286,6 +348,28 @@ button.link { border: 0; background: none; padding: 4px 0; color: var(--accent);
 .welcome p[hidden] { display: none; }
 .welcome-small { font-size: 13px !important; color: var(--muted); }
 .welcome .start { margin-top: 8px; }
+
+/* ---------- session summary ---------- */
+
+.summary { width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 48px); }
+.summary h3 { margin: 18px 0 8px; font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 14px 0 12px; }
+.tile { display: flex; flex-direction: column; gap: 2px; padding: 12px; border-radius: 10px; background: var(--surface-2); }
+.tile-value { font-size: 22px; font-weight: 650; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
+.tile-label { font-size: 12.5px; }
+.tile-sub { font-size: 12px; color: var(--muted); }
+.summary-changes { max-height: 260px; overflow: auto; }
+.summary-changes section + section { margin-top: 10px; }
+.summary-changes h4 { margin: 0 0 4px; font-size: 13px; }
+.summary-changes ul { margin: 0; padding-left: 18px; font-size: 14px; line-height: 1.5; }
+.summary-changes li.undone { color: var(--muted); text-decoration: line-through; }
+.summary-changes code { font-size: 12px; background: var(--surface-2); padding: 1px 4px; border-radius: 4px; }
+.tag { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); text-decoration: none; vertical-align: 1px; }
+.summary-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.summary .start { margin-top: 0; }
+.secondary { border: 1px solid var(--line); background: var(--surface); border-radius: var(--radius); padding: 9px 16px; cursor: pointer; }
+.summary-links { margin-left: auto; display: flex; gap: 14px; }
+@media (max-width: 600px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
 /* ---------- control panel ---------- */
 
@@ -325,9 +409,9 @@ button.link { border: 0; background: none; padding: 4px 0; color: var(--accent);
 .panel .segmented button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
 .intensity-blurb { margin: 6px 0 0; text-align: right; font-size: 12px; }
 .status { margin: 10px 0 0; font-size: 13px; color: var(--muted); }
-.start-over { display: flex; gap: 10px; align-items: center; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
-.start-over .note { margin: 0; font-size: 12px; }
-.start-over button { white-space: nowrap; }
+.session-actions { display: flex; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.panel .session-actions .end { border-color: var(--accent); background: var(--surface); color: var(--accent); font-weight: 600; }
+.session-note { margin: 8px 0 0 !important; font-size: 12px !important; }
 .note { margin: 0 0 10px; font-size: 13px; color: var(--muted); }
 
 .changes, .activity { margin: 0 0 10px; padding-left: 20px; font-size: 13px; }

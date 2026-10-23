@@ -26,7 +26,12 @@
         <span class="step-n">2</span>
         <div class="step-body">
           <h2>Edit the prompt <span class="optional">optional</span></h2>
-          <p class="note">This is the base prompt. The settings below add the rest: what the model may change, how eager it is, and the answer format.</p>
+
+          <h3 class="first">App to adapt</h3>
+          <div id="scenarios" class="chips"></div>
+
+          <h3>Base prompt</h3>
+          <p class="note">The settings below add the rest: what the model may change, how eager it is, and the answer format.</p>
           <textarea id="prompt" rows="14" spellcheck="false"></textarea>
           <button id="prompt-reset" type="button" class="link">Reset to default</button>
 
@@ -47,7 +52,7 @@
           <details class="preview">
             <summary>Full prompt sent to the model</summary>
             <pre id="prompt-preview"></pre>
-            <p class="note">Each round also sends a message listing every control and the recent activity.</p>
+            <p class="note">Each round also sends a message listing every element, the recent activity and anything the person asked for.</p>
           </details>
         </div>
       </div>
@@ -59,10 +64,22 @@
       </div>
     </section>
 
-    <div id="app-wrap" hidden><div id="app" class="app"></div></div>
+    <div id="session" hidden>
+      <form id="ask" class="ask" autocomplete="off">
+        <span class="ask-icon" aria-hidden="true">✦</span>
+        <input id="ask-input" type="text" aria-label="Ask for a change">
+        <kbd class="ask-kbd">⌘K</kbd>
+        <button type="submit">Ask</button>
+      </form>
+      <p id="ask-status" class="ask-status" hidden>
+        <span id="ask-reply"></span>
+        <button id="ask-undo" type="button" class="link">Undo</button>
+      </p>
+      <div id="app-wrap"><div id="app" class="app"></div></div>
+    </div>
     <div id="toast" class="toast" role="status"></div>
 
-    <div id="confirm" class="confirm" role="dialog" aria-label="Suggested change" hidden>
+    <div id="confirm" class="popover" role="dialog" aria-label="Suggested change" hidden>
       <p class="confirm-kicker">Suggested change</p>
       <p id="confirm-what" class="confirm-what"></p>
       <p id="confirm-why" class="confirm-why"></p>
@@ -72,6 +89,25 @@
         <span id="confirm-more" class="confirm-more"></span>
       </div>
     </div>
+
+    <div id="request" class="popover" role="dialog" aria-label="Change this element" hidden>
+      <form id="request-form" autocomplete="off">
+        <p class="confirm-kicker">Change this</p>
+        <p id="request-target" class="request-target"></p>
+        <input id="request-input" type="text" placeholder="e.g. make it bigger, call it …" aria-label="What should change?">
+        <div class="confirm-actions">
+          <button type="submit" class="confirm-yes">Change</button>
+          <button id="request-cancel" type="button" class="confirm-no">Cancel</button>
+        </div>
+      </form>
+      <div id="request-result" hidden>
+        <p id="request-reply" class="confirm-what"></p>
+        <div class="confirm-actions">
+          <button id="request-ok" type="button" class="confirm-yes">OK</button>
+          <button id="request-undo" type="button" class="confirm-no">Undo</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <dialog id="welcome" class="welcome" aria-labelledby="welcome-title">
@@ -79,10 +115,28 @@
       <p class="welcome-kicker">Training mode</p>
       <h2 id="welcome-title">This app adapts to you</h2>
       <p>While you use it, it watches what you click, where you pause and what you select, and adjusts itself: wording, layout and styles can change to make things easier to find.</p>
-      <p id="welcome-confirm-note">Before each change, a small note will ask you first. Choose Apply to make the change or Not now to skip it.</p>
+      <p>You can also ask for changes: type in the bar above the app, or right-click anything and choose what should change.</p>
+      <p id="welcome-confirm-note">Before each change it suggests on its own, a small note will ask you first. Choose Apply to make the change or Not now to skip it.</p>
       <p class="welcome-small">Nothing leaves your browser. Changes can be undone at any time.</p>
       <button class="start" value="ok" autofocus>Got it</button>
     </form>
+  </dialog>
+
+  <dialog id="summary" class="welcome summary" aria-labelledby="summary-title">
+    <p class="welcome-kicker">Session ended</p>
+    <h2 id="summary-title"></h2>
+    <div id="summary-tiles" class="tiles"></div>
+    <p id="summary-activity" class="welcome-small"></p>
+    <h3>What changed</h3>
+    <div id="summary-changes" class="summary-changes"></div>
+    <div class="summary-actions">
+      <button id="summary-new" type="button" class="start">Start a new session</button>
+      <button id="summary-keep" type="button" class="secondary">Keep this layout</button>
+      <span class="summary-links">
+        <button id="summary-export" type="button" class="link">Export log</button>
+        <button id="summary-resume" type="button" class="link">Resume adapting</button>
+      </span>
+    </div>
   </dialog>
 
   <aside class="panel">
@@ -100,10 +154,11 @@
       </div>
       <p id="intensity-blurb" class="note intensity-blurb"></p>
       <p id="status" class="status"></p>
-      <div class="start-over">
+      <div class="session-actions">
+        <button id="end-session" class="end">End session</button>
         <button id="start-over">Start over</button>
-        <span class="note">Fresh visit with the original layout. Doesn't count as undoing anything.</span>
       </div>
+      <p class="note session-note">End stops adapting and shows a summary. Start over returns to the original layout as a fresh visit, without counting as undoing anything.</p>
     </section>
 
     <section>
