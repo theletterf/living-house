@@ -34,6 +34,9 @@ can a small model reshape one, in real time, around the person using it?
 - A browser with WebGPU: a recent Chrome or Edge.
 - Any static file server. There is no build step and no dependencies to install; the
   model runtime ([WebLLM](https://github.com/mlc-ai/web-llm)) loads from a CDN.
+  Runtime and model files require downloads on first use. Inference, prompts,
+  interaction data and performance measurements stay in the browser. There is no
+  remote inference service or telemetry.
 
 ## Run
 
@@ -67,12 +70,25 @@ Open http://localhost:8642.
 - **The ask bar** above the app (⌘K / Ctrl+K) takes requests that aren't about one element:
   "warmer colors", "I never use the garage door".
 
-Requests apply immediately, without the confirmation step, and reply in one line with an
-*Undo*. If the model can't do something with the changes it's allowed to make, it says so
-instead of making an unrelated change. Requests override the soft limits (locked
-elements, per-element caps, intensity) but never the validity and safety checks. Every
-request stays in the prompt as a standing preference for the rest of the session, and
-requests work even with adaptation paused.
+Clear commands such as "Rename Overview to Home" run without model inference.
+A page name is shared by its heading, navigation label and help references. Renaming
+either the heading or navigation updates all three. Undo restores them together.
+If a name matches unrelated elements, choose the target from the displayed buttons.
+Right-click commands also support "call it Lights", "make it bigger", "highlight this",
+"make it red", "put it first", and "pin this".
+
+Other requests use one model call. They show whether they are waiting or processing.
+A newer request replaces an unfinished older request. Requests skip the confirmation
+step and report the edits applied, with an *Undo* button. A targeted request cannot
+edit another element. The complete plan must pass validation before any edit applies.
+General model requests can still misunderstand an instruction; inspect the reported
+edits and use Undo if needed.
+
+Requested names are protected from later automatic renames. Repeating a completed
+direct command reports success without adding a change. Requests override the soft
+limits (locked elements, per-element caps, intensity), but preserve validity and safety
+checks. Completed requests become standing preferences for later automatic rounds.
+Requests work even with adaptation paused.
 
 ### The panel
 
@@ -88,10 +104,32 @@ The panel on the right controls the session:
   unanswered ones expire.
 - **Intensity** sets how eagerly the UI changes:
   - *Gentle*: after a 2.5 s pause, at most every 12 s, 1 change, only when you seem stuck.
-  - *Balanced*: after a 1.2 s pause, at most every 5 s, up to 2 changes.
-  - *Max* (default): every action starts a round right away, and the model must propose
-    at least one change. There is no retry when a proposal is rejected: it doubled the
-    wait and small models mostly repeated themselves.
+  - *Balanced*: after a 1.2 s pause, at most every 5 s, 1 change.
+  - *Max* (default): considers a change immediately when activity supplies evidence.
+  - *Extreme*: seeks 1 useful improvement after each click, control change,
+    page change, hesitation, text selection, reading event or help interaction.
+    It does not wait for repeated activity. It can clarify labels, add hints, improve
+    styles, reorder controls or pin actions on the current page and latest target.
+    Each element allows up to 100 changes per session. Ordinary hovering does not
+    trigger rounds. Interactions during inference are combined into the next round;
+    same-page activity does not discard the current result.
+
+  Gentle, Balanced and Max require repeated hesitation, repeated use, several page changes without
+  an action, or looking up a control after hesitation. Reading and a single pause do
+  not trigger changes. The model may return no changes. Automatic rounds and model
+  requests do not retry. Repeated use can move or pin a control. Difficulty can
+  trigger a clearer label or hint. These three levels require a direct request for
+  style changes. Extreme also permits useful style changes automatically.
+
+  Extreme keeps confirmation, Undo, requested-name protection, enabled operation
+  settings and validation. It can return no changes when no useful edit is available.
+  It does not run continuously without new interaction. Events within 200 ms are
+  combined. Only one model call runs at a time. Automatic inference pauses when
+  three changes are waiting for confirmation or safe application.
+
+  The 0.5B model cannot rename elements automatically. Direct rename commands still
+  work. Automatic style changes use moderate text sizes, weights, line heights,
+  padding or light highlights. Requests can still use the full supported style set.
 - **End session** stops adapting and shows a summary: how long the session lasted, how
   many changes were kept or undone, your requests, how many suggestions you accepted or
   declined, what you did, and every change grouped by page. From there you can start a
@@ -143,9 +181,8 @@ renders, for someone who asked to rename the ceiling light, as:
   does, its current name and state, and whether it's pinned.
 - Articles are checked against the registry when the app loads; a reference to an
   element that doesn't exist is reported as an error.
-- Using the help feeds back into adaptation: looking something up means it was hard to
-  find, so the model sees it (at *Max* it reacts right away), and it counts as friction
-  for the settled detector.
+- Help use feeds back into adaptation. Looking up a control after hesitation can
+  trigger adaptation. Help use also counts as friction for the settled detector.
 
 ### Keeping the layout
 
@@ -161,8 +198,8 @@ training period first, then a house that has learned you.
 ### Signals
 
 Clicks and control changes (switches, sliders, steppers), page changes, hovering over controls, hesitating on a control (1.5 s) or on a
-page (3 s), selecting text, and pointing at text (0.6 s). Hesitation is read as
-confusion. Every signal can be switched off and every threshold changed in the setup.
+page (3 s), selecting text, and pointing at text (0.6 s). A pause alone is not treated
+as confusion. Every signal can be switched off and every threshold changed in the setup.
 
 ### What the model can change
 
@@ -182,9 +219,17 @@ confusion. Every signal can be switched off and every threshold changed in the s
 | `scenarios.js` | The apps that can be adapted, as plain data: pages, rows and controls |
 | `docs.js` | Help articles for each app, written as templates against element IDs |
 | `app.js` | Element registry, rendering, signal logging, requests, validation, applying and undoing changes, session summary |
-| `adapters.js` | Model loading, prompt building, JSON-schema-constrained decoding |
+| `adapters.js` | Worker model loading, prompt building, JSON-schema-constrained decoding |
+| `model-worker.js` | Local browser worker for model inference |
+| `dom.js` | Update changed DOM nodes while preserving controls and focus |
+| `performance.js` | Local performance aggregates |
+| `requests.js` | Direct command parsing, target resolution, evidence for automatic changes |
 | `styles.css` | Styles (light theme only) |
 
+- Inference runs in a dedicated Web Worker, separate from the interface thread.
+  Worker failures are reported, and unloading a model terminates its worker.
+- The app updates existing DOM nodes. It preserves control identity and uncommitted
+  slider values during unrelated updates. Activity updates are combined per frame.
 - Every element has an id. Each round, the model gets a list of the elements (with their
   text, purpose, current state, custom style and usage stats), the recent activity and
   the person's standing requests, and answers in JSON.
@@ -196,9 +241,10 @@ confusion. Every signal can be switched off and every threshold changed in the s
   models got the old shared `text` field wrong (labels sent as CSS, empty styles). The
   schema doesn't depend on what is locked or pinned, so WebLLM can reuse its compiled
   grammar between rounds.
-- The context is kept short, since reading it is most of a round's time: full detail
-  for the current page, the shared parts and anything touched recently, one line per
-  other page, and a list of changes already made so the model doesn't repeat them.
+- Automatic rounds send at most six relevant targets in Extreme mode and the
+  evidence target in other modes. They request one edit per round. The schema uses
+  stable IDs for the whole scenario, so changing pages does not change its ID list.
+  Recent activity and completed changes give context without sending the full UI.
 - Every proposal is validated before it's applied. Style changes are checked with
   `CSS.supports`, and values that would load anything from outside (`url()`, `@import`,
   …) are refused.
@@ -211,8 +257,18 @@ confusion. Every signal can be switched off and every threshold changed in the s
 
 *Export log* downloads a JSONL file with every event (including each setup version with
 its full prompt), every change, and each round's raw model output and rejected changes.
+Request rounds also record queue, inference and apply times. Automatic rounds
+record queue, preparation, inference and validation times. The export includes
+aggregate render times and long browser tasks where the browser supports them.
+These measurements stay local and do not include network telemetry.
 The idea is to use these logs to train a small model on the changes that actually
 helped.
+
+## Checks
+
+Run `node --test *.test.mjs` to check direct requests, background scheduling,
+validation, Undo, DOM updates and worker error handling without downloading a model.
+These tests do not measure real GPU inference speed or browser layout.
 
 ## License
 

@@ -465,7 +465,7 @@ button.link { border: 0; background: none; padding: 4px 0; color: var(--accent);
 
 .row { display: flex; gap: 8px; align-items: center; }
 .check { display: flex; gap: 8px; align-items: center; margin-top: 10px; font-size: 14px; }
-.intensity { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; font-size: 14px; }
+.intensity { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; font-size: 14px; }
 .segmented { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
 .panel .segmented button { border: 0; border-radius: 0; background: var(--surface); padding: 4px 10px; }
 .panel .segmented button + button { border-left: 1px solid var(--line); }

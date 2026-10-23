@@ -17,21 +17,24 @@ export const CSS_PROPERTIES = [
   "padding", "margin", "width", "min-width", "opacity", "display", "transform",
 ];
 
+const AUTOMATIC_CSS_PROPERTIES = ["font-size", "font-weight", "line-height", "padding", "background-color"];
+
 const CONTROL_KINDS = ["nav", "action", "toggle", "slider", "stepper"];
 const PINNABLE_KINDS = ["action", "toggle"];
 
 // How eagerly the UI changes. "pause" levels wait for a quiet moment; "action"
-// runs a round after every action and requires the model to change something.
+// considers a round after an action when repeated activity supplies evidence.
 export const INTENSITIES = {
-  gentle: { label: "Gentle", blurb: "Changes only when you seem stuck.", trigger: "pause", idleMs: 2500, minGapMs: 12000, perRound: 1, perControl: 2, always: false },
-  balanced: { label: "Balanced", blurb: "Changes after a short pause.", trigger: "pause", idleMs: 1200, minGapMs: 5000, perRound: 2, perControl: 3, always: false },
-  max: { label: "Max", blurb: "Every action gets a change.", trigger: "action", idleMs: 0, minGapMs: 0, perRound: 2, perControl: 8, always: true },
+  gentle: { label: "Gentle", blurb: "Changes only when you seem stuck.", trigger: "pause", idleMs: 2500, minGapMs: 12000, perRound: 1, perControl: 2, always: false, cautious: true },
+  balanced: { label: "Balanced", blurb: "Changes after a short pause.", trigger: "pause", idleMs: 1200, minGapMs: 5000, perRound: 1, perControl: 3, always: false },
+  max: { label: "Max", blurb: "Responds to repeated use or difficulty.", trigger: "action", idleMs: 0, minGapMs: 0, perRound: 1, perControl: 8, always: false },
+  extreme: { label: "Extreme", blurb: "Seeks useful changes after almost every interaction.", trigger: "action", idleMs: 0, minGapMs: 0, perRound: 1, perControl: 100, always: false, eager: true },
 };
 
 // `noThinking`: Qwen3 reasons out loud by default, which is slow and breaks
 // the JSON; WebLLM turns it off per request.
 export const ENGINES = {
-  "Qwen2.5-0.5B-Instruct-q4f16_1-MLC": { label: "Qwen2.5 0.5B Instruct" },
+  "Qwen2.5-0.5B-Instruct-q4f16_1-MLC": { label: "Qwen2.5 0.5B Instruct", conservative: true },
   "Qwen2.5-1.5B-Instruct-q4f16_1-MLC": { label: "Qwen2.5 1.5B Instruct" },
   "Qwen2.5-3B-Instruct-q4f16_1-MLC": { label: "Qwen2.5 3B Instruct" },
   "Qwen3-1.7B-q4f16_1-MLC": { label: "Qwen3 1.7B", noThinking: true },
@@ -39,12 +42,38 @@ export const ENGINES = {
   "Llama-3.2-3B-Instruct-q4f16_1-MLC": { label: "Llama 3.2 3B Instruct" },
 };
 
-export async function loadEngine(key, onProgress) {
-  const webllm = await import(WEBLLM_URL);
-  const engine = await webllm.CreateMLCEngine(key, {
-    initProgressCallback: (p) => onProgress(p.text),
-  });
-  const complete = (ctx, schema) => engine.chat.completions.create({
+export async function loadEngine(key, onProgress, {
+  loadRuntime = () => import(WEBLLM_URL),
+  makeWorker = () => new Worker(new URL("./model-worker.js", import.meta.url), { type: "module" }),
+} = {}) {
+  const webllm = await loadRuntime();
+  const worker = makeWorker();
+  let fail;
+  let workerError = null;
+  const failed = new Promise((_, reject) => { fail = reject; });
+  // Keep a failure observable even when the worker is idle.
+  failed.catch(() => {});
+  const onError = (event) => {
+    workerError = new Error(event.message || "The local model worker stopped. Reload the model.");
+    fail(workerError);
+    worker.terminate();
+  };
+  worker.addEventListener("error", onError);
+  worker.addEventListener("messageerror", onError);
+  const run = async (operation) => {
+    if (workerError) throw workerError;
+    return Promise.race([operation(), failed]);
+  };
+  let engine;
+  try {
+    engine = await run(() => webllm.CreateWebWorkerMLCEngine(worker, key, {
+      initProgressCallback: (p) => onProgress(p.text),
+    }));
+  } catch (error) {
+    worker.terminate();
+    throw error;
+  }
+  const complete = (ctx, schema) => run(() => engine.chat.completions.create({
     messages: [
       { role: "system", content: buildSystemPrompt(ctx.config.prompt, ctx.level, ctx.config.ops, { request: Boolean(ctx.request) }) },
       { role: "user", content: describeContext(ctx) },
@@ -55,7 +84,7 @@ export async function loadEngine(key, onProgress) {
     // Constrained decoding: each change type has its own shape, and ids are
     // limited to the elements that change type can apply to.
     response_format: { type: "json_object", schema },
-  });
+  }));
   return {
     key,
     async propose(ctx) {
@@ -75,7 +104,9 @@ export async function loadEngine(key, onProgress) {
         // with thinking off, so parse from the first brace.
         parsed = JSON.parse(raw.slice(raw.indexOf("{")));
       } catch {
-        // Truncated output (hit max_tokens) is the usual cause; treat as no-op.
+        throw new Error(res.choices[0].finish_reason === "length"
+          ? "The model output was cut short. Try a simpler request."
+          : "The model returned invalid JSON.");
       }
       const limit = ctx.request ? REQUEST_MAX_CHANGES : ctx.level.perRound;
       return {
@@ -86,7 +117,16 @@ export async function loadEngine(key, onProgress) {
         usage: res.usage,
       };
     },
-    unload: () => engine.unload(),
+    interrupt: () => engine.interruptGenerate(),
+    async unload() {
+      try { await run(() => engine.unload()); }
+      catch { /* Termination also releases a failed worker's model resources. */ }
+      finally {
+        worker.removeEventListener("error", onError);
+        worker.removeEventListener("messageerror", onError);
+        worker.terminate();
+      }
+    },
   };
 }
 
@@ -104,19 +144,19 @@ function toChange(c) {
 export const DEFAULT_GUIDANCE = `You adapt an app's interface to the person using it, so they find what they need faster.
 
 How to read what they did:
-- Hesitating (pausing without acting) means confusion: make that control clearer or easier to see.
-- Visiting several pages or clicking the wrong control first means a label is unclear.
+- A pause alone is not confusion. Repeated hesitation on the same control may justify a clearer label or hint.
+- Several page changes without using a control may mean navigation is unclear. Offer a clearer label only when its purpose supports that label.
 - Using the same control again and again is a habit: make it easier to reach.
-- Selecting or pointing at text, or looking something up in the help, shows what they want: make the matching control stand out.
-- Things they asked for earlier still hold. After a declined change, try a different kind of change.
+- Reading, pointing, selecting text and opening help are normal activity, not proof of confusion. Outside Extreme mode, they do not justify a change by themselves.
+- Respect earlier requests. A declined change is evidence to leave that element alone, not an instruction to try another decoration.
 
-Rules: change only elements connected to what they did. A new label says what the control does (see "what it is") and must differ from the current one.
+Rules: preserve the purpose and meaning of each element. Never invent capabilities or facts. A reason must state a practical benefit, not merely say the change is clearer. Use the selected intensity to decide when to seek improvements. Return no changes unless there is a clear practical benefit. Do not add arbitrary decoration. Change only elements connected to what they did. A new label says what the control does (see "what it is") and must differ from the current one.
 
-Example. Activity: hesitated on x_insights "Insights" 1.5s (confused); clicked x_trends "Trends"; clicked x_insights "Insights".
+Example. Activity: hesitated on x_insights "Insights" 1.5s (possible difficulty); clicked x_trends "Trends"; clicked x_insights "Insights".
 Answer: {"changes":[{"op":"text","id":"x_insights","text":"Monthly reports","reason":"Unclear label"}]}
 
 Example. Activity: selected text "Order #4411 · Shipped" in orders.row0.
-Answer: {"changes":[{"op":"style","id":"x_track","property":"background-color","value":"#e7f0ff","reason":"Tracking is the next step"}]}`;
+Answer: {"changes":[]}`;
 
 const OP_DOCS = {
   text: `- text: new wording for an element with text (max 24 characters for controls). {"op":"text","id":…,"text":…,"reason":…}`,
@@ -137,9 +177,11 @@ Requests and the changes that do them:
 - "call it Lights" → text "Lights"
 - "put it first" → move_first
 - "I use this a lot" → pin`
+    : level.eager
+      ? `Extreme mode: actively seek 1 useful improvement after this interaction, without waiting for repeated use or confusion. Improve the latest target or nearby controls on the current page. Make labels more specific, add useful hints, improve readability or spacing, highlight a relevant next action, or bring likely actions within reach. Explain the practical benefit. Preserve the meaning of each control. Never rename a page to the app name or replace a specific action with a vague label. Reading and successful use can reveal an opportunity; they do not prove confusion. Respect requested names, Undo and declined changes. Do not repeat an existing edit or decorate without a purpose. Return no changes only when no useful valid improvement is available.`
     : level.always
       ? `Always propose 1 or ${count === "1 change" ? "1" : "2"} changes, about the element most connected to the latest action.`
-      : level.perRound === 1
+      : level.cautious
         ? `Propose at most ${count}, and only when the person is clearly struggling. Otherwise return {"changes": []}.`
         : `Propose at most ${count}. If nothing clearly needs to change, return {"changes": []}.`;
   const format = request
@@ -152,6 +194,7 @@ When to change: ${eagerness}
 
 Changes you can make:
 ${OPS.filter((op) => ops.includes(op)).map((op) => OP_DOCS[op]).join("\n")}
+${!request && ops.includes("style") ? "Automatic styles: font-size 14–24px; font-weight 400, 500, 600 or 700; line-height 1.3–1.8; padding 4–20px per side; background-color #fff3bf, #e7f0ff or #e8f5e9. No other automatic style changes." : ""}
 
 Keep each reason under 8 words. Answer with JSON only: ${format}`;
 }
@@ -186,7 +229,7 @@ function describeContext(ctx) {
     ? `\n\nThey asked for these earlier; keep respecting them:\n${ctx.preferences.map((p) => `- "${p.text}"${p.id ? ` (about ${p.id})` : ""}`).join("\n")}`
     : "";
   const retry = ctx.rejected?.length
-    ? `\n\nYour previous answer was rejected:\n${ctx.rejected.map((r) => `${r.op} ${r.id} "${r.text ?? ""}": ${r.why}`).join("\n")}\nPropose something different.`
+    ? `\n\nYour previous answer was rejected:\n${ctx.rejected.map((r) => `${r.op} ${r.id} "${r.text ?? ""}": ${r.why}`).join("\n")}\nCorrect only the rejected operation. Preserve the requested target and value.`
     : "";
   const question = ctx.request
     ? `They ask you now: "${ctx.request.text}"${ctx.request.id ? `, about ${ctx.request.id}` : ""}. Which changes do exactly that?`
@@ -209,8 +252,8 @@ export function describeEvent(e) {
     case "nav": return `opened page "${e.to}" via ${e.id}`;
     case "hover": return `hovered ${e.id} "${e.label}" ${s(e.ms)}`;
     case "hesitate": return e.id
-      ? `hesitated on ${e.id} "${e.label}" ${s(e.ms)} (confused)`
-      : `hesitated on page "${e.page}" ${s(e.ms)} without doing anything (confused)`;
+      ? `hesitated on ${e.id} "${e.label}" ${s(e.ms)} (possible difficulty)`
+      : `hesitated on page "${e.page}" ${s(e.ms)} without doing anything (possible difficulty)`;
     case "click": return `clicked ${e.id} "${e.label}"`;
     case "set": return `set ${e.id} "${e.label}" to ${e.value}`;
     case "select": return `selected text "${e.text}"${e.id ? ` in ${e.id}` : ""} on page "${e.view}"`;
@@ -229,7 +272,7 @@ export function describeEvent(e) {
 // and recompiling made some rounds several seconds slower. Locks and pins are
 // enforced by the app's validation instead.
 function changeSchema(ctx, strict) {
-  const ids = (pred) => ctx.elements.filter(pred).map((e) => e.id);
+  const ids = (pred) => (ctx.schemaElements ?? ctx.elements).filter(pred).map((e) => e.id);
   const str = (max) => (strict ? { type: "string", maxLength: max } : { type: "string" });
   const shape = (op, idList, fields) => ({
     type: "object",
@@ -239,7 +282,7 @@ function changeSchema(ctx, strict) {
   });
   const shapes = {
     text: () => shape("text", ids((e) => e.kind !== "box"), { text: str(120) }),
-    style: () => shape("style", ids(() => true), { property: { type: "string", enum: CSS_PROPERTIES }, value: str(40) }),
+    style: () => shape("style", ids(() => true), { property: { type: "string", enum: ctx.request ? CSS_PROPERTIES : AUTOMATIC_CSS_PROPERTIES }, value: str(40) }),
     hint: () => shape("hint", ids((e) => CONTROL_KINDS.includes(e.kind)), { text: str(48) }),
     move_first: () => shape("move_first", ids((e) => CONTROL_KINDS.includes(e.kind)), {}),
     pin: () => shape("pin", ids((e) => PINNABLE_KINDS.includes(e.kind)), {}),

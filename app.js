@@ -1,12 +1,16 @@
+import { patchHTML } from "./dom.js";
+import { recordTiming, observeLongTasks } from "./performance.js";
+import { parseCommand, resolveCommand, adaptationEvidence, automaticStyleIssue } from "./requests.js";
 import { DEFAULT_GUIDANCE, ENGINES, INTENSITIES, OPS, buildSystemPrompt, describeEvent, loadEngine } from "./adapters.js";
 import { DEFAULT_SCENARIO, SCENARIOS } from "./scenarios.js";
 import { CONDITION, DOCS, TOKEN } from "./docs.js";
 
 const MAX_PINS = 4;
 const MODEL_EVENTS = new Set(["hover", "hesitate", "click", "set", "nav", "select", "read"]);
-// At "Max" each of these starts a round. A plain hover is context, not an action.
-// Looking something up in the help means it was hard to find, so it counts too.
-const ACTION_EVENTS = new Set(["hesitate", "click", "set", "nav", "select", "read", "help_show"]);
+// These events may start a round once repeated activity supplies evidence.
+const ACTION_EVENTS = new Set(["hesitate", "click", "set", "nav", "help_show"]);
+// Extreme includes reading and help use, but not ordinary pointer motion or hover.
+const EXTREME_EVENTS = new Set([...ACTION_EVENTS, "read", "select", "help_open"]);
 // What the model sees as recent activity: the signals plus the person's answers
 // to proposed changes, their own requests and their use of the help (none of
 // which can be switched off).
@@ -106,11 +110,14 @@ const state = {
   settledSnoozedAt: 0,   // "Keep going" restarts the settled detector from here
   lastSettledCheck: 0,
   rounds: [],
+  metrics: {},
+  adaptDueAt: 0,
   adaptive: true,
   intensity: "max",
   engine: null,
   engineKey: null,
   busy: false,
+  revision: 0, // invalidates background results after a request or session reset
   requestBusy: false,
   loading: false,
   lastRound: 0,
@@ -137,6 +144,7 @@ const $app = $("app");
 const now = () => Math.round(performance.now());
 const esc = (s) => String(s).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch]);
 const level = () => INTENSITIES[state.intensity];
+const triggerEvents = () => level().eager ? EXTREME_EVENTS : ACTION_EVENTS;
 const S = () => SCENARIOS[state.scenario];
 const firstPage = () => Object.keys(S().pages)[0];
 
@@ -150,7 +158,7 @@ function buildElements(scenario, saved = null) {
   });
   for (const g of GLOBALS) add(g.id === "brand" ? { ...g, text: sc.brand } : g);
   for (const [p, page] of Object.entries(sc.pages)) {
-    add({ id: `${p}.title`, kind: "text", page: p, desc: "Page heading" });
+    add({ id: `${p}.title`, kind: "text", page: p, desc: "Page heading; shares its name with the navigation item" });
     add({ id: `${p}.lede`, kind: "text", page: p, text: page.lede, desc: "Intro line under the heading" });
     add({ id: `${p}.toolbar`, kind: "box", page: p, desc: "Area holding this page's controls" });
     add({ id: `${p}.rows`, kind: "box", page: p, desc: "List of items on this page" });
@@ -163,6 +171,15 @@ function buildElements(scenario, saved = null) {
   }
   for (const [id, fields] of Object.entries(saved?.elements ?? {})) {
     if (els.has(id)) Object.assign(els.get(id), structuredClone(fields));
+  }
+  // Older kept layouts could rename a heading independently. Use that visible
+  // page name for navigation too, then restore one source for both labels.
+  for (const c of sc.controls.filter((c) => c.to)) {
+    const heading = els.get(`${c.to}.title`);
+    if (heading?.text != null) {
+      els.get(c.id).text = heading.text;
+      heading.text = null;
+    }
   }
   return els;
 }
@@ -204,11 +221,16 @@ const controls = () => [...state.els.values()].filter(isControl);
 const siblings = (c) => controls().filter((s) => s.view === c.view);
 const toolbar = (view) => controls().filter((c) => c.view === view).sort((a, b) => a.order - b.order);
 const navFor = (page) => controls().find((c) => c.to === page);
-// A page heading follows its nav label until it is changed itself.
+// A page has one name, shared by its heading, navigation and help references.
+function textTargets(el) {
+  const nav = el.kind === "nav" && el.to ? el : el.id === `${el.page}.title` ? navFor(el.page) : null;
+  return nav ? [nav, state.els.get(`${nav.to}.title`)].filter(Boolean) : [el];
+}
+const changeSlot = (ch) => ch.op === "text" ? textTargets(state.els.get(ch.id))[0].id : ch.id;
 const displayText = (el) => (el.kind === "box" ? null : el.text ?? navFor(el.page).text);
 const labelOf = (el) => displayText(el) ?? el.desc;
 const cssText = (style) => Object.entries(style).map(([k, v]) => `${k}: ${v}`).join("; ");
-const pageName = (page) => (page === "all" ? "Everywhere" : S().controls.find((c) => c.to === page)?.text ?? page);
+const pageName = (page) => (page === "all" ? "Everywhere" : navFor(page)?.text ?? page);
 
 function valueText(c) {
   if (c.kind === "toggle") return c.states ? c.states[c.value ? 1 : 0] : c.value ? "On" : "Off";
@@ -233,9 +255,20 @@ function log(type, data = {}) {
     // Anything but the page-level hesitation itself ends that hesitation.
     if (!(type === "hesitate" && !e.id)) state.pageHesitated = false;
   }
-  if (ACTION_EVENTS.has(type)) setTimeout(maybeRunRound, 0);
-  renderActivity();
+  if (triggerEvents().has(type) && !state.adaptDueAt) {
+    state.adaptDueAt = now() + 200;
+    setTimeout(maybeRunRound, 200);
+  }
+  scheduleActivity();
   return e;
+}
+
+// Several events can arrive in one frame. Paint their activity list once.
+let activityFrame = false;
+function scheduleActivity() {
+  if (activityFrame) return;
+  activityFrame = true;
+  requestAnimationFrame(() => { activityFrame = false; renderActivity(); });
 }
 
 // ---------- rendering the app ----------
@@ -295,6 +328,7 @@ function restoreSelection(saved) {
 }
 
 function render() {
+  const renderAt = performance.now();
   const selection = saveSelection();
   const p = state.view;
   const app = state.els.get("app");
@@ -304,7 +338,7 @@ function render() {
   else $app.removeAttribute("title");
 
   const pinned = controls().filter((c) => c.pinned).sort((a, b) => a.pinnedAt - b.pinnedAt);
-  $app.innerHTML = `
+  patchHTML($app, `
     <header class="app-top" ${box("header")}>
       <span class="brand" ${textAttrs("brand")}>${textOf("brand")}</span>
       <div class="quick" data-toolbar="quick" ${box("quick")}>
@@ -317,7 +351,7 @@ function render() {
       <p class="lede" ${textAttrs(`${p}.lede`)}>${textOf(`${p}.lede`)}</p>
       <div class="toolbar" data-toolbar="${p}" ${box(`${p}.toolbar`)}>${toolbar(p).map(control).join("")}</div>
       <ul class="rows" ${box(`${p}.rows`)}>${S().pages[p].rows.map((_, i) => `<li ${textAttrs(`${p}.row${i}`)}>${textOf(`${p}.row${i}`)}</li>`).join("")}</ul>
-    </main>`;
+    </main>`);
 
   const t = now();
   for (const [id, until] of state.flashUntil) {
@@ -331,6 +365,7 @@ function render() {
   // and the help renders whatever the elements are called right now.
   renderConfirm();
   renderHelp();
+  recordTiming(state.metrics, "render", performance.now() - renderAt);
 }
 
 let toastTimer;
@@ -519,7 +554,7 @@ function buildContext() {
     return {
       id, kind: el.kind, page: el.page, text: displayText(el), desc: el.desc, value: valueText(el), css: cssText(el.style),
       pinned: el.pinned, hint: el.hint,
-      // Locked elements are hidden from the model and from its output schema.
+      // Locked elements are omitted from the prompt; validation enforces locks.
       locked: el.frozen || el.changeCount >= level().perControl,
       hoverMs: 0, hesitations: 0, clicks: 0, ...stats.get(id),
     };
@@ -528,36 +563,71 @@ function buildContext() {
     .map((c) => `${c.op} ${c.id}${c.text ? ` "${c.text}"` : ""}`);
   return {
     level: level(), config: state.config, about: S().about, view: p, elements,
+    schemaElements: [...state.els.values()].map(({ id, kind }) => ({ id, kind })),
     recent: recent.slice(-20), preferences: state.preferences.slice(-6), done,
   };
 }
 
 async function runRound() {
-  state.busy = true;
-  const ctx = buildContext();
-  state.windowStart = state.events.length;
   const t0 = now();
-  const round = { at: t0, kind: "adapt", engine: state.engineKey, intensity: state.intensity, configVersion: state.configVersion, attempts: 0, raw: [], accepted: [], rejected: [] };
+  const queuedAt = state.events.slice(state.windowStart).find((e) => triggerEvents().has(e.type))?.t ?? t0;
+  state.busy = true;
+  const revision = state.revision;
+  const ctx = buildContext();
+  const focus = adaptationEvidence(ctx.recent);
+
+  if (ctx.level.eager) {
+    const latest = ctx.recent.filter((e) => EXTREME_EVENTS.has(e.type)).at(-1);
+    const occupied = new Set([...state.pending, ...state.proposals].flatMap((ch) => ch.op === "text" ? textTargets(state.els.get(ch.id)).map((el) => el.id) : [ch.id]));
+    // Allow related improvements across the page instead of only the clicked control.
+    const recentIds = [...new Set(ctx.recent.slice().reverse().map((e) => e.id).filter(Boolean))];
+    const priority = (e) => e.id === latest?.id ? -2 : recentIds.includes(e.id) ? recentIds.indexOf(e.id) : 100;
+    ctx.elements = ctx.elements.filter((e) =>
+      (e.id === latest?.id || e.page === ctx.view || e.id === navFor(ctx.view)?.id) && !e.locked && !occupied.has(e.id))
+      .sort((a, b) => priority(a) - priority(b)).slice(0, 6);
+  } else {
+    const evidenceEvent = ctx.recent.filter((e) => ACTION_EVENTS.has(e.type)).at(-1);
+    const usefulOps = ["click", "set"].includes(evidenceEvent?.type) ? ["pin", "move_first"] : ["text", "hint"];
+    ctx.config = { ...ctx.config, ops: ctx.config.ops.filter((op) => usefulOps.includes(op)) };
+    ctx.elements = ctx.elements.filter((e) => e.id === focus && !e.locked);
+  }
+  if (ENGINES[state.engineKey]?.conservative) {
+    ctx.config = { ...ctx.config, ops: ctx.config.ops.filter((op) => op !== "text") };
+  }
+  state.windowStart = state.events.length;
+  state.adaptDueAt = 0;
+  const round = { queueMs: Math.max(0, t0 - queuedAt), prepareMs: now() - t0, inferenceMs: 0, validationMs: 0, at: t0, kind: "adapt", engine: state.engineKey, intensity: state.intensity, configVersion: state.configVersion, attempts: 0, raw: [], accepted: [], rejected: [] };
   try {
+    if (!ctx.elements.length || !ctx.config.ops.length) { round.noChange = true; return; }
     // One attempt only. A retry with the rejection reasons doubled the wait,
     // and small models mostly repeated the rejected change anyway.
     while (round.attempts < 1) {
       round.attempts++;
-      const res = await state.engine.propose({ ...ctx, rejected: round.rejected });
+      const inferAt = now();
+      const res = await state.engine.propose({ ...ctx, rejected: round.rejected }).finally(() => { round.inferenceMs = now() - inferAt; });
+      const validateAt = now();
       round.raw.push(res.raw);
       round.usage = res.usage;
-      const seen = new Set([...state.pending, ...state.proposals].map((p) => p.id));
+      // Extreme coalesces interactions during inference. Same-page activity must
+      // not discard every result while the person continues to use the app.
+      if (revision !== state.revision || state.view !== ctx.view || state.intensity !== round.intensity ||
+          (!ctx.level.eager && state.events.slice(state.windowStart).some((e) => ACTION_EVENTS.has(e.type)))) {
+        round.cancelled = true;
+        break;
+      }
+      const seen = new Set([...state.pending, ...state.proposals].map(changeSlot));
       for (const ch of res.changes.slice(0, ctx.level.perRound)) {
-        const why = seen.has(ch?.id) ? "already changing this round" : validate(ch);
+        const why = !ctx.elements.some((e) => e.id === ch?.id) ? "unrelated to current evidence" : !ctx.config.ops.includes(ch.op) ? "operation does not fit the evidence" : seen.has(changeSlot(ch)) ? "already changing this round" : validate(ch);
         if (why) {
           round.rejected.push({ ...ch, why });
         } else {
-          seen.add(ch.id);
+          seen.add(changeSlot(ch));
           round.accepted.push(ch);
           queueChange(ch);
         }
       }
-      if (!res.changes.length) round.rejected.push({ op: "none", id: "-", why: "no change proposed" });
+      if (!res.changes.length) round.noChange = true;
+      round.validationMs = now() - validateAt;
     }
   } catch (err) {
     round.error = String(err?.message ?? err);
@@ -569,9 +639,14 @@ async function runRound() {
 function finishRound(round, t0) {
   round.latencyMs = now() - t0;
   state.rounds.push(round);
+  recordTiming(state.metrics, "queue", round.queueMs);
+  recordTiming(state.metrics, "inference", round.inferenceMs);
+  recordTiming(state.metrics, "validation", round.validationMs);
   log("round", {
     kind: round.kind, engine: round.engine, latencyMs: round.latencyMs, attempts: round.attempts,
     accepted: round.accepted.length, rejected: round.rejected.length, error: round.error,
+    cancelled: round.cancelled, noChange: round.noChange, prepareMs: round.prepareMs, validationMs: round.validationMs, queueMs: round.queueMs, inferenceMs: round.inferenceMs, applyMs: round.applyMs,
+    rejections: round.rejected,
     // The first rejection says what went wrong, which a bare count doesn't.
     why: round.rejected[0] && `${round.rejected[0].op} ${round.rejected[0].id}: ${round.rejected[0].why}`,
   });
@@ -587,12 +662,15 @@ function maybeRunRound() {
   // The person's own requests come first and work even with adaptation off.
   if (state.requests.length) return runRequest(state.requests.shift());
   if (!state.adaptive) return;
+  if (state.pending.length + state.proposals.length >= MAX_PROPOSALS) return;
+  if (now() < state.adaptDueAt) return;
   const lvl = level();
+  if (!lvl.eager && !adaptationEvidence(state.events.slice(state.sessionStart).filter((e) => CONTEXT_EVENTS.has(e.type)).slice(-20))) return;
   const fresh = state.events.slice(state.windowStart);
   const t = now();
   const due = lvl.trigger === "action"
-    ? fresh.some((e) => ACTION_EVENTS.has(e.type))
-    : fresh.some((e) => MODEL_EVENTS.has(e.type)) && t - state.lastActivity > lvl.idleMs && t - state.lastRound > lvl.minGapMs;
+    ? fresh.some((e) => triggerEvents().has(e.type))
+    : fresh.some((e) => triggerEvents().has(e.type)) && t - state.lastActivity > lvl.idleMs && t - state.lastRound > lvl.minGapMs;
   if (due) runRound();
 }
 
@@ -622,22 +700,27 @@ function validate(ch, { explicit = false } = {}) {
   if (!el) return "unknown element";
   if (!state.config.ops.includes(ch.op)) return "change type turned off";
   const text = typeof ch.text === "string" ? ch.text.trim() : "";
+  const targets = ch.op === "text" ? textTargets(el) : [el];
   if (!explicit) {
-    if (el.frozen) return "locked after undo";
-    if (el.changeCount >= level().perControl) return "changed too often";
+    if (ch.op === "text" && ENGINES[state.engineKey]?.conservative) return "automatic renames need a larger model";
+    if (ch.op === "text" && targets.some((t) => t.kind === "nav") && text.toLowerCase() === S().brand.toLowerCase()) return "a page name must describe the page, not the app";
+    if (ch.op === "text" && state.changes.some((c) => c.requested && !c.undone && c.op === "text" && targets.some((t) => t.id === c.id))) return "name set by the person";
+    if (targets.some((t) => t.frozen)) return "locked after undo";
+    if (targets.some((t) => t.changeCount >= level().perControl)) return "changed too often";
     if (state.declined.has(proposalKey(ch))) return "the person declined this exact change";
   }
   switch (ch.op) {
     case "text": {
       if (el.kind === "box") return "this element has no text";
-      const max = isControl(el) ? 24 : 120;
+      const max = targets.some(isControl) ? 24 : 120;
       if (!text || text.length > max) return `text empty or longer than ${max}`;
-      if (text === displayText(el)) return "same text";
+      if (targets.every((t) => text === displayText(t))) return "same text";
       return null;
     }
     case "style": {
       const decls = parseDeclarations(text);
       if (typeof decls === "string") return decls;
+      if (!explicit && automaticStyleIssue(decls)) return automaticStyleIssue(decls);
       if (decls.every(([p, v]) => (el.style[p] ?? "") === v)) return "same style";
       return null;
     }
@@ -683,68 +766,130 @@ function closeRequest() {
   renderConfirm();
 }
 
+function requestElements() {
+  return [...state.els.values()].map((el) => ({
+    id: el.id, text: displayText(el), aliases: aliases(el.id), kind: el.kind,
+    follows: el.id.endsWith(".title") && el.text == null ? navFor(el.page)?.id : null,
+  }));
+}
+
 function submitRequest(req) {
   if (!canRequest()) return;
-  req.phase = "working";
+  req.submittedAt = now();
+  req.command = parseCommand(req.text);
+  req.phase = "queued";
   req.changes = [];
   if (req.ui === "popover" && state.request) state.request.req = req;
   else state.barRequest = req;
-  state.preferences.push({ text: req.text, id: req.id });
+  req.revision = ++state.revision;
+  // Old suggestions must not compete with a new instruction.
+  state.pending = [];
+  state.proposals = [];
+  if (state.busy && !state.requestBusy) state.engine.interrupt?.();
   log("request", { id: req.id, text: req.text, via: req.ui });
+  renderConfirm();
+  if (req.command) return runRequest(req, true);
   state.requests.push(req);
   renderRequestFeedback(req);
   maybeRunRound();
 }
 
-async function runRequest(req) {
-  state.busy = true;
-  state.requestBusy = true;
-  // A direct request can touch anything, including locked elements.
-  const base = buildContext();
-  const ctx = { ...base, elements: base.elements.map((e) => ({ ...e, locked: false })), request: { text: req.text, id: req.id } };
+async function runRequest(req, direct = false) {
+  if (req.revision !== state.revision) {
+    req.phase = "done";
+    req.reply = "A newer request or session replaced this request.";
+    renderRequestFeedback(req);
+    setTimeout(maybeRunRound, 0);
+    return;
+  }
+  if (!direct) {
+    state.busy = true;
+    state.requestBusy = true;
+  }
+  req.phase = "working";
+  renderRequestFeedback(req);
+  const revision = state.revision;
   const t0 = now();
-  const round = { at: t0, kind: "request", request: req.text, target: req.id, engine: state.engineKey, configVersion: state.configVersion, attempts: 0, raw: [], accepted: [], rejected: [] };
-  let reply = "";
-  let modelDeclined = false;
+  const round = { at: t0, kind: "request", request: req.text, target: req.id, engine: direct ? "direct" : state.engineKey, configVersion: state.configVersion,
+    queueMs: t0 - req.submittedAt, inferenceMs: 0, applyMs: 0, attempts: 0, raw: [], accepted: [], rejected: [] };
   try {
-    while (round.attempts < 2 && !req.changes.length) {
-      round.attempts++;
-      const res = await state.engine.propose({ ...ctx, rejected: round.rejected });
+    let changes;
+    if (direct) {
+      const plan = resolveCommand(req.command, requestElements(), req.id);
+      req.candidates = plan.candidates;
+      if (plan.error) { req.reply = plan.error; return; }
+      changes = plan.changes;
+    } else {
+      const base = buildContext();
+      // A targeted request needs only that element. General requests get the registry,
+      // without unrelated activity that can distract from the instruction.
+      const all = [...state.els.values()].map((el) => ({
+        id: el.id, kind: el.kind, page: el.page, text: displayText(el), desc: el.desc,
+        value: valueText(el), css: cssText(el.style), pinned: el.pinned, hint: el.hint, locked: false,
+      }));
+      const elements = all.filter((e) => !req.id || e.id === req.id);
+      const ctx = { ...base, schemaElements: all, elements, recent: [], done: [], preferences: [], request: { text: req.text, id: req.id } };
+      round.attempts = 1;
+      const inferAt = now();
+      const res = await state.engine.propose(ctx);
+      round.inferenceMs = now() - inferAt;
       round.raw.push(res.raw);
       round.usage = res.usage;
-      reply = res.reply;
-      modelDeclined = !res.changes.length;
-      for (const ch of res.changes) {
-        const why = validate(ch, { explicit: true });
-        if (why) {
-          round.rejected.push({ ...ch, why });
-        } else {
-          round.accepted.push(ch);
-          req.changes.push(apply(ch, { requested: req.text }).n);
-        }
+      if (revision !== state.revision) {
+        round.cancelled = true;
+        req.reply = "A newer request or session replaced this request.";
+        return;
       }
-      // An empty answer is the model saying it can't; its reply says why.
-      if (modelDeclined) break;
+      changes = res.changes;
+      if (!changes.length) { req.reply = res.reply || "No supported change was found."; return; }
     }
-    if (req.changes.length) {
+    // Validate the complete plan first. A failed multi-edit request changes nothing.
+    const applyAt = now();
+    const ready = [];
+    let unchanged = 0;
+    const fields = new Set();
+    let pins = controls().filter((el) => el.pinned).length;
+    for (const ch of changes) {
+      const why = req.id && ch.id !== req.id ? "outside the requested element" : validate(ch, { explicit: true });
+      if (direct && ["same text", "same style", "same hint", "already first", "already pinned"].includes(why)) unchanged++;
+      else if (why) round.rejected.push({ ...ch, why });
+      else {
+        const field = `${changeSlot(ch)}|${ch.op}|${ch.op === "style" ? parseDeclarations(ch.text).map(([p]) => p).join(",") : ""}`;
+        if (fields.has(field)) round.rejected.push({ ...ch, why: "conflicting edits to the same field" });
+        else if (ch.op === "pin" && ++pins > MAX_PINS) round.rejected.push({ ...ch, why: "quick bar full" });
+        else { fields.add(field); ready.push(ch); }
+      }
+    }
+    if (round.rejected.length) {
+      req.reply = `No changes applied: ${round.rejected.map((r) => r.why).join("; ")}.`;
+    } else {
+      for (const ch of ready) {
+        round.accepted.push(ch);
+        req.changes.push(apply(ch, { requested: req.text }).n);
+      }
+      state.preferences.push({ text: req.text, id: req.id });
+      req.reply = ready.length
+        ? `Done: ${req.changes.map((n) => appliedText(state.changes.find((c) => c.n === n))).join("; ")}.`
+        : unchanged ? "Already set as requested." : "No changes needed.";
       render();
       renderChanges();
-      // Say what was actually done; small models' replies often just echo
-      // the request or contradict what they did.
-      req.reply = `Done: ${req.changes.map((n) => appliedText(state.changes.find((c) => c.n === n))).join("; ")}.`;
-    } else if (modelDeclined) {
-      req.reply = reply || "I couldn't do that.";
-    } else {
-      req.reply = `I couldn't do that: ${round.rejected.at(-1)?.why ?? "no valid change"}.`;
     }
+    round.applyMs = now() - applyAt;
   } catch (err) {
     round.error = String(err?.message ?? err);
-    req.reply = "Something went wrong. Try again.";
+    req.reply = `The request failed: ${round.error}`;
   } finally {
     req.phase = "done";
-    state.requestBusy = false;
     renderRequestFeedback(req);
-    finishRound(round, t0);
+    if (direct) {
+      round.latencyMs = now() - t0;
+      state.rounds.push(round);
+      log("round", { kind: "request", engine: "direct", latencyMs: round.latencyMs, attempts: 0, accepted: round.accepted.length,
+        rejected: round.rejected.length, why: round.rejected[0]?.why, rejections: round.rejected, queueMs: round.queueMs, inferenceMs: 0, applyMs: round.applyMs, error: round.error });
+    } else {
+      state.requestBusy = false;
+      finishRound(round, t0);
+    }
   }
 }
 
@@ -759,8 +904,8 @@ function appliedText(c) {
 }
 
 function renderRequestFeedback(req) {
-  const working = req.phase === "working";
-  const message = working ? "Working on it…" : req.reply;
+  const working = req.phase !== "done";
+  const message = req.phase === "queued" ? "Waiting for the model…" : working ? "Processing your request…" : req.reply;
   const canUndo = !working && req.changes.length > 0 && !req.undone;
   if (req.ui === "popover") {
     if (state.request?.req !== req) {
@@ -779,11 +924,21 @@ function renderRequestFeedback(req) {
     $("ask-reply").textContent = message;
     $("ask-undo").hidden = !canUndo;
   }
+  if (!working && req.candidates?.length) {
+    const host = req.ui === "popover" && state.request?.req === req ? $("request-reply") : $("ask-reply");
+    for (const candidate of req.candidates) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = `${candidate.text} (${candidate.id})`;
+      button.addEventListener("click", () => submitRequest({ text: req.text, id: candidate.id, ui: req.ui }));
+      host.append(" ", button);
+    }
+  }
 }
 
 function undoRequest(req) {
   if (!req || req.undone) return;
-  for (const n of req.changes) undo(n);
+  for (const n of [...req.changes].reverse()) undo(n);
   req.undone = true;
   req.reply = "Undone.";
   renderRequestFeedback(req);
@@ -791,7 +946,11 @@ function undoRequest(req) {
 
 // ---------- help: live docs written against element IDs ----------
 
-const originalLabel = (id) => S().controls.find((c) => c.id === id)?.text ?? null;
+const originalLabel = (id) => {
+  const el = state.els.get(id);
+  const navId = el && textTargets(el)[0].id;
+  return S().controls.find((c) => c.id === navId)?.text ?? null;
+};
 const docIds = (body) => [
   ...[...body.matchAll(TOKEN)].map((m) => m[2]),
   ...body.split("\n\n").map((p) => p.match(CONDITION)?.[2]).filter(Boolean),
@@ -810,13 +969,15 @@ function paragraphs(body) {
 // Every name an element has had: the original, renames this session, and now.
 function aliases(id) {
   const el = state.els.get(id);
-  const names = [originalLabel(id), ...state.changes.filter((c) => c.id === id && c.op === "text").map((c) => c.label), el && labelOf(el)];
+  const ids = new Set(el ? textTargets(el).map((t) => t.id) : [id]);
+  const names = [originalLabel(id), ...state.changes.filter((c) => ids.has(c.id) && c.op === "text").flatMap((c) => [c.label, c.text]), el && labelOf(el)];
   return [...new Set(names.filter(Boolean))];
 }
 
 // Why an element looks the way it does, for the reference's tooltip.
 function changeNote(id) {
-  const last = state.changes.filter((c) => c.id === id && !c.undone).at(-1);
+  const ids = new Set(textTargets(state.els.get(id)).map((t) => t.id));
+  const last = state.changes.filter((c) => (c.id === id || c.op === "text" && ids.has(c.id)) && !c.undone).at(-1);
   if (last) return last.requested ? "changed at your request" : `changed by the ${S().noun}: ${last.reason}`;
   const el = state.els.get(id);
   return el && originalLabel(id) && originalLabel(id) !== labelOf(el) ? "changed in an earlier session" : "";
@@ -889,13 +1050,13 @@ function renderHelp() {
 
   if (article === "reference") {
     $("help-title").textContent = "All controls";
-    $("help-body").innerHTML = referenceHTML();
+    patchHTML($("help-body"), referenceHTML());
     return;
   }
   if (article) {
     const doc = DOCS[state.scenario].find((d) => d.id === article);
     $("help-title").textContent = doc.title;
-    $("help-body").innerHTML = renderTemplate(doc.body);
+    patchHTML($("help-body"), renderTemplate(doc.body));
     return;
   }
 
@@ -914,7 +1075,7 @@ function renderHelp() {
     }) : [];
     return `<li><button type="button" data-article="${topic.id}">${esc(topic.title)}</button><span>${renamed.length ? `<em>${[...new Set(renamed)].join(", ")}</em>` : esc(topic.blurb)}</span></li>`;
   }).filter(Boolean);
-  $("help-body").innerHTML = items.length ? `<ul class="help-list">${items.join("")}</ul>` : `<p class="note">No topics match “${esc(query)}”.</p>`;
+  patchHTML($("help-body"), items.length ? `<ul class="help-list">${items.join("")}</ul>` : `<p class="note">No topics match “${esc(query)}”.</p>`);
 }
 
 function openHelp(article = null) {
@@ -958,7 +1119,7 @@ function lintDocs() {
 // to the element it would change. Apply makes it; Not now drops it and tells
 // the model, but locks nothing (unlike Undo).
 
-const proposalKey = (ch) => `${ch.op}|${ch.id}|${(ch.text ?? "").trim()}`;
+const proposalKey = (ch) => `${ch.op}|${changeSlot(ch)}|${(ch.text ?? "").trim()}`;
 
 function queueChange(ch) {
   if (!state.askFirst) {
@@ -1035,7 +1196,7 @@ function renderConfirm() {
   const show = Boolean(ch) && !state.setupOpen && !state.modalOpen && !state.ended && !state.request && !state.settledOpen;
   $("confirm").hidden = !show;
   if (show) {
-    $("confirm-what").innerHTML = describeProposal(ch);
+    patchHTML($("confirm-what"), describeProposal(ch));
     $("confirm-why").textContent = ch.reason || "";
     $("confirm-more").textContent = state.proposals.length > 1 ? `+${state.proposals.length - 1} more` : "";
   }
@@ -1109,14 +1270,19 @@ function apply(ch, { confirmed = false, requested = null } = {}) {
   const el = state.els.get(ch.id);
   const text = (ch.text ?? "").trim();
   const label = labelOf(el);
+  const targets = ch.op === "text" ? textTargets(el) : [el];
   const before = {
     text: el.text,
+    texts: targets.map((t) => [t.id, t.text]),
     hint: el.hint,
     style: { ...el.style },
     orders: isControl(el) ? siblings(el).map((s) => [s.id, s.order]) : [],
   };
   switch (ch.op) {
-    case "text": el.text = text; break;
+    case "text":
+      targets[0].text = text;
+      for (const target of targets.slice(1)) target.text = null;
+      break;
     case "style":
       for (const [p, v] of parseDeclarations(text)) {
         if (v) el.style[p] = v;
@@ -1127,10 +1293,12 @@ function apply(ch, { confirmed = false, requested = null } = {}) {
     case "move_first": el.order = Math.min(...siblings(el).map((s) => s.order)) - 1; break;
     case "pin": el.pinned = true; el.pinnedAt = now(); break;
   }
-  el.changeCount++;
-  el.adapted = true;
-  el.adaptReason = requested ? `You asked: ${requested}` : ch.reason || ch.op;
-  state.flashUntil.set(el.id, now() + 1600);
+  for (const target of targets) {
+    target.changeCount++;
+    target.adapted = true;
+    target.adaptReason = requested ? `You asked: ${requested}` : ch.reason || ch.op;
+    state.flashUntil.set(target.id, now() + 1600);
+  }
   const entry = {
     n: state.changes.length + 1, at: now(), op: ch.op, id: el.id, page: el.page, text, reason: ch.reason ?? "", label, before,
     engine: state.engineKey, configVersion: state.configVersion, confirmed, requested, undone: false,
@@ -1145,7 +1313,9 @@ function undo(n) {
   if (!entry || entry.undone) return;
   const el = state.els.get(entry.id);
   switch (entry.op) {
-    case "text": el.text = entry.before.text; break;
+    case "text":
+      for (const [id, text] of entry.before.texts ?? [[el.id, entry.before.text]]) state.els.get(id).text = text;
+      break;
     case "style": el.style = { ...entry.before.style }; break;
     case "hint": el.hint = entry.before.hint; break;
     case "move_first": for (const [id, o] of entry.before.orders) state.els.get(id).order = o; break;
@@ -1153,9 +1323,12 @@ function undo(n) {
   }
   entry.undone = true;
   // An undo is a strong "leave this alone" signal.
-  el.frozen = true;
-  el.adapted = state.changes.some((e) => e.id === el.id && !e.undone);
-  if (!el.adapted) el.adaptReason = null;
+  for (const target of entry.op === "text" ? textTargets(el) : [el]) {
+    target.frozen = true;
+    target.adapted = state.changes.some((e) => !e.undone &&
+      (e.id === target.id || e.op === "text" && textTargets(state.els.get(e.id)).some((t) => t.id === target.id)));
+    if (!target.adapted) target.adaptReason = null;
+  }
   log("undo", { n, op: entry.op, id: el.id });
   render();
   renderChanges();
@@ -1165,6 +1338,9 @@ function undo(n) {
 // is locked and nothing is recorded as a rejection; the adapter just stops
 // seeing earlier activity. The export log is kept.
 function resetSession() {
+  state.revision++;
+  state.adaptDueAt = 0;
+  if (state.busy) state.engine?.interrupt?.();
   endHover();
   seed();
   state.view = firstPage();
@@ -1443,7 +1619,7 @@ function renderSetup() {
   $("model-status").textContent = !hasGPU
     ? "This needs WebGPU to run a model in the browser. Open it in a recent Chrome or Edge."
     : state.status || (state.engine
-      ? `${ENGINES[state.engineKey].label} is ready.`
+      ? `${ENGINES[state.engineKey].label} is ready.${ENGINES[state.engineKey].conservative ? " Automatic renames are disabled for this model. Direct rename requests still work." : ""}`
       : "Picking a model starts the download. The first load fetches several hundred MB; after that it's cached.");
   const problem = !state.engine
     ? (state.loading ? "Waiting for the model to finish loading…" : "Pick a model first.")
@@ -1536,21 +1712,23 @@ function renderStatus() {
     else if (state.proposals.length) s = `${state.proposals.length} change(s) waiting for your confirmation.`;
     else if (state.busy) s = "Thinking…";
     else if (state.pending.length) s = `${state.pending.length} change(s) waiting for the pointer to move away.`;
-    else if (level().trigger === "action") s = "Watching. Every action gets a change.";
+    else if (level().eager) s = "Watching. Seeking improvements after each interaction.";
+    else if (level().trigger === "action") s = "Watching. Changes need repeated use or signs of difficulty.";
     else s = `Watching. Changes are considered after a ${level().idleMs / 1000} s pause.`;
   }
-  $("status").textContent = s;
-  $("model-name").textContent = state.engineKey ? ENGINES[state.engineKey].label : "No model yet";
+  if ($("status").textContent !== s) $("status").textContent = s;
+  const modelName = state.engineKey ? ENGINES[state.engineKey].label : "No model yet";
+  if ($("model-name").textContent !== modelName) $("model-name").textContent = modelName;
 }
 
 function renderChanges() {
-  $("changes").innerHTML = state.changes.length
+  patchHTML($("changes"), state.changes.length
     ? state.changes.slice().reverse().map((e) => {
         const undoBtn = e.undone ? "" : `<button data-undo="${e.n}">Undo</button>`;
         const why = e.requested ? `You asked: “${esc(e.requested)}”` : esc(e.reason);
         return `<li class="${e.undone ? "undone" : ""}">${changeText(e)}${undoBtn}<span class="why">${why}</span></li>`;
       }).join("")
-    : `<li class="empty">No changes yet.</li>`;
+    : `<li class="empty">No changes yet.</li>`);
 }
 
 function renderActivity() {
@@ -1574,7 +1752,7 @@ function renderActivity() {
       : e.type;
     return `<li class="${e.type === "hesitate" ? "warn" : ""}">${esc(text)}</li>`;
   });
-  $("activity").innerHTML = items.join("") || `<li class="empty">Nothing yet.</li>`;
+  patchHTML($("activity"), items.join("") || `<li class="empty">Nothing yet.</li>`);
 }
 
 function renderIntensity() {
@@ -1631,6 +1809,7 @@ function setupControls() {
     renderIntensity();
     renderSetup();
     renderStatus();
+    maybeRunRound();
   });
   renderIntensity();
 
@@ -1744,6 +1923,7 @@ function exportLog() {
     ...state.changes.map(({ before, ...e }) => ({ kind: "change", ...e })),
     ...state.rounds.map((r) => ({ kind: "round", ...r })),
     { kind: "ui", scenario: state.scenario, elements: [...state.els.values()] },
+    { kind: "performance", metrics: state.metrics },
   ].map((x) => JSON.stringify(x));
   const url = URL.createObjectURL(new Blob([lines.join("\n") + "\n"], { type: "application/x-ndjson" }));
   const a = Object.assign(document.createElement("a"), { href: url, download: `living-house-${Date.now()}.jsonl` });
@@ -1752,6 +1932,8 @@ function exportLog() {
 }
 
 // ---------- boot ----------
+
+observeLongTasks(state.metrics);
 
 lintDocs();
 seed();
