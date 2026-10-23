@@ -94,8 +94,30 @@ The panel on the right controls the session:
   many changes were kept or undone, your requests, how many suggestions you accepted or
   declined, what you did, and every change grouped by page. From there you can start a
   new session, keep the adapted layout, export the log, or resume adapting.
-- **Start over** restores the original app as a fresh visit. It locks nothing and isn't
-  recorded as a rejection; the model just stops seeing earlier activity.
+- **Start over** returns to the starting layout as a fresh visit. It locks nothing and
+  isn't recorded as a rejection; the model just stops seeing earlier activity.
+
+### When a session ends
+
+Ending is always your call, but the house notices when adapting has stopped paying off
+and offers to end with a small popover:
+
+- **Its suggestions stop landing**: 4 of the last 5 were declined, undone or left to
+  expire.
+- **The friction is gone**: 3 minutes of real use (at least 10 actions) with no hesitation
+  and no searching around (three page changes in a row without doing anything), once the
+  house has changed something.
+
+*Keep going* restarts the detector from that moment, so it doesn't nag. Both the
+suggestion and the friction-free time can be changed in the setup.
+
+### Keeping the layout
+
+*Keep this layout* in the summary saves how the app differs from the original (texts,
+styles, hints, order, pins; not device states) in the browser. Next time, the setup
+offers to start from the kept layout or the original, or to forget it. New sessions and
+*Start over* begin from whichever you chose, and adaptation continues from there: a
+training period first, then a house that has learned you.
 - **Changes** lists every applied change with its reason and an *Undo* button. Undo
   restores the change and locks that element so the model leaves it alone.
 - **Activity** shows the signals, model rounds and decisions as they happen.

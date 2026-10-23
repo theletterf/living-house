@@ -12,6 +12,24 @@ const MAX_PROPOSALS = 3; // confirmations waiting at once; older ones expire
 const CONTROL_KINDS = new Set(["nav", "action", "toggle", "slider", "stepper"]);
 const PINNABLE = new Set(["action", "toggle"]);
 
+// "Settled": when to suggest ending the session.
+const SETTLED_OUTCOMES = 5;   // look at this many recent suggestion outcomes…
+const SETTLED_NEGATIVE = 4;   // …and suggest ending if this many went badly
+const CALM_MIN_ACTIONS = 10;  // a calm stretch only counts with real use in it
+
+// A kept layout is what differs from the original in these fields, per element.
+const LAYOUT_FIELDS = ["text", "style", "hint", "order", "pinned", "pinnedAt"];
+const layoutKey = (scenario) => `living-house:layout:${scenario}`;
+
+// Browser storage can be unavailable (private mode, blocked site data).
+function loadLayout(scenario) {
+  try {
+    return JSON.parse(localStorage.getItem(layoutKey(scenario)) ?? "null");
+  } catch {
+    return null;
+  }
+}
+
 const OP_LABELS = {
   text: "Change any text",
   style: "Restyle anything (any CSS)",
@@ -35,6 +53,9 @@ const signalOf = (type, data) =>
 
 const defaultConfig = () => ({
   scenario: DEFAULT_SCENARIO,
+  base: "saved",       // start from the kept layout when there is one
+  suggestEnd: true,
+  calmMs: 180000,      // friction-free use before suggesting the session has settled
   prompt: DEFAULT_GUIDANCE,
   ops: [...OPS],
   signals: Object.keys(SIGNALS),
@@ -77,6 +98,10 @@ const state = {
   ended: false,
   sessionBeganAt: 0,
   endedAt: 0,
+  baseInUse: "original", // the layout this session started from
+  settledOpen: false,
+  settledSnoozedAt: 0,   // "Keep going" restarts the settled detector from here
+  lastSettledCheck: 0,
   rounds: [],
   adaptive: true,
   intensity: "max",
@@ -109,14 +134,16 @@ const level = () => INTENSITIES[state.intensity];
 const S = () => SCENARIOS[state.scenario];
 const firstPage = () => Object.keys(S().pages)[0];
 
-function seed() {
-  state.els.clear();
-  const add = (el) => state.els.set(el.id, {
+// The element registry for a scenario, optionally with a kept layout on top.
+function buildElements(scenario, saved = null) {
+  const sc = SCENARIOS[scenario];
+  const els = new Map();
+  const add = (el) => els.set(el.id, {
     text: null, page: "all", style: {}, hint: null, pinned: false, pinnedAt: 0,
     frozen: false, adapted: false, adaptReason: null, changeCount: 0, ...el,
   });
-  for (const g of GLOBALS) add(g.id === "brand" ? { ...g, text: S().brand } : g);
-  for (const [p, page] of Object.entries(S().pages)) {
+  for (const g of GLOBALS) add(g.id === "brand" ? { ...g, text: sc.brand } : g);
+  for (const [p, page] of Object.entries(sc.pages)) {
     add({ id: `${p}.title`, kind: "text", page: p, desc: "Page heading" });
     add({ id: `${p}.lede`, kind: "text", page: p, text: page.lede, desc: "Intro line under the heading" });
     add({ id: `${p}.toolbar`, kind: "box", page: p, desc: "Area holding this page's controls" });
@@ -124,10 +151,46 @@ function seed() {
     page.rows.forEach((text, i) => add({ id: `${p}.row${i}`, kind: "text", page: p, text, desc: "Item in this page's list" }));
   }
   const orderByView = {};
-  for (const c of S().controls) {
+  for (const c of sc.controls) {
     const order = (orderByView[c.view] = (orderByView[c.view] ?? -1) + 1);
     add({ ...c, kind: c.kind ?? (c.view === "nav" ? "nav" : "action"), page: c.view === "nav" ? "all" : c.view, order });
   }
+  for (const [id, fields] of Object.entries(saved?.elements ?? {})) {
+    if (els.has(id)) Object.assign(els.get(id), structuredClone(fields));
+  }
+  return els;
+}
+
+const effectiveBase = (cfg, scenario) => (cfg.base === "saved" && loadLayout(scenario) ? "saved" : "original");
+
+function seed() {
+  state.baseInUse = effectiveBase(state.config, state.scenario);
+  state.els = buildElements(state.scenario, state.baseInUse === "saved" ? loadLayout(state.scenario) : null);
+}
+
+// Keep the current layout for next time: only what differs from the original.
+function saveLayout() {
+  const original = buildElements(state.scenario);
+  const elements = {};
+  for (const [id, el] of state.els) {
+    const o = original.get(id);
+    if (o && LAYOUT_FIELDS.some((f) => JSON.stringify(el[f]) !== JSON.stringify(o[f]))) {
+      elements[id] = Object.fromEntries(LAYOUT_FIELDS.map((f) => [f, el[f]]));
+    }
+  }
+  const count = Object.keys(elements).length;
+  if (!count) {
+    toast("Nothing differs from the original, so there's nothing to keep.");
+    return;
+  }
+  try {
+    localStorage.setItem(layoutKey(state.scenario), JSON.stringify({ savedAt: Date.now(), count, elements }));
+  } catch {
+    toast("This browser won't let the page save the layout.");
+    return;
+  }
+  log("layout_saved", { scenario: state.scenario, count });
+  toast(`Layout kept. The ${S().noun} will start like this next time.`);
 }
 
 const isControl = (el) => CONTROL_KINDS.has(el.kind);
@@ -774,8 +837,9 @@ function anchorFor(el) {
 
 function renderConfirm() {
   const ch = state.proposals[0];
-  // A suggestion waits while the person is writing their own request.
-  const show = Boolean(ch) && !state.setupOpen && !state.modalOpen && !state.ended && !state.request;
+  // A suggestion waits while the person is writing their own request or
+  // deciding whether to end the session.
+  const show = Boolean(ch) && !state.setupOpen && !state.modalOpen && !state.ended && !state.request && !state.settledOpen;
   $("confirm").hidden = !show;
   if (show) {
     $("confirm-what").innerHTML = describeProposal(ch);
@@ -790,6 +854,7 @@ function positionPopovers() {
   const ch = state.proposals[0];
   if (ch && !$("confirm").hidden) positionPopover($("confirm"), anchorFor(state.els.get(ch.id)));
   if (state.request) positionPopover($("request"), anchorFor(state.els.get(state.request.id)));
+  if (state.settledOpen) positionPopover($("settled"), $app);
 }
 
 function positionPopover(pop, anchorNode) {
@@ -819,6 +884,7 @@ function positionPopover(pop, anchorNode) {
 function showWelcome() {
   state.modalOpen = true;
   $("welcome-confirm-note").hidden = !state.askFirst;
+  $("welcome-saved-note").hidden = state.baseInUse !== "saved";
   $("welcome").showModal();
   renderConfirm();
 }
@@ -873,7 +939,7 @@ function apply(ch, { confirmed = false, requested = null } = {}) {
   el.adaptReason = requested ? `You asked: ${requested}` : ch.reason || ch.op;
   state.flashUntil.set(el.id, now() + 1600);
   const entry = {
-    n: state.changes.length + 1, op: ch.op, id: el.id, page: el.page, text, reason: ch.reason ?? "", label, before,
+    n: state.changes.length + 1, at: now(), op: ch.op, id: el.id, page: el.page, text, reason: ch.reason ?? "", label, before,
     engine: state.engineKey, configVersion: state.configVersion, confirmed, requested, undone: false,
   };
   state.changes.push(entry);
@@ -921,11 +987,13 @@ function resetSession() {
   state.ended = false;
   state.sessionBeganAt = 0;
   state.endedAt = 0;
+  state.settledSnoozedAt = 0;
+  closeSettled();
   state.barRequest = null;
   $("ask-status").hidden = true;
   getSelection().removeAllRanges();
   closeRequest();
-  log("start_over", { scenario: state.scenario });
+  log("start_over", { scenario: state.scenario, base: state.baseInUse });
   state.sessionStart = state.windowStart = state.events.length;
   state.lastActivity = now();
   render();
@@ -952,6 +1020,7 @@ function endSession() {
   state.pending = [];
   state.requests = [];
   closeRequest();
+  closeSettled();
   const summary = summarize();
   log("session_end", summary);
   renderStage();
@@ -1021,10 +1090,79 @@ function openSummary() {
   $("summary").showModal();
 }
 
+// ---------- noticing that the session has settled ----------
+// Ending is always the person's call, but the house can notice when adapting
+// has stopped paying off and offer to end. Returns why, or null.
+
+function settledReason(t) {
+  const since = state.settledSnoozedAt || state.sessionBeganAt;
+  if (!state.config.suggestEnd || !since) return null;
+  const events = state.events.slice(state.sessionStart).filter((e) => e.t >= since);
+
+  // 1. Its suggestions stopped landing: declined, undone or left to expire.
+  const outcomes = [
+    ...state.changes.filter((c) => !c.requested && c.at >= since).map((c) => ({ t: c.at, bad: c.undone })),
+    ...events.filter((e) => (e.type === "decision" && !e.accepted) || e.type === "expired").map((e) => ({ t: e.t, bad: true })),
+  ].sort((a, b) => a.t - b.t).slice(-SETTLED_OUTCOMES);
+  if (outcomes.length >= SETTLED_OUTCOMES && outcomes.filter((o) => o.bad).length >= SETTLED_NEGATIVE) {
+    return "Most of its recent suggestions were declined or undone, so it's probably not helping much anymore.";
+  }
+
+  // 2. The friction is gone: real use with no hesitating and no searching
+  // around (three page changes in a row without doing anything). Only counts
+  // once the house has actually changed something.
+  if (!state.changes.some((c) => !c.undone)) return null;
+  let calmFrom = since;
+  let navRun = 0;
+  for (const e of events) {
+    if (e.type === "hesitate") calmFrom = e.t;
+    if (e.type === "nav") {
+      if (++navRun >= 3) calmFrom = e.t;
+    } else if (e.type === "click" || e.type === "set") {
+      navRun = 0;
+    }
+  }
+  const actions = events.filter((e) => e.t >= calmFrom && ["click", "set", "nav"].includes(e.type)).length;
+  if (t - calmFrom >= state.config.calmMs && actions >= CALM_MIN_ACTIONS) {
+    return `${fmtDuration(t - calmFrom)} of use without hesitating or searching around.`;
+  }
+  return null;
+}
+
+function openSettled(reason) {
+  state.settledOpen = true;
+  $("settled-title").textContent = `The ${S().noun} seems settled.`;
+  $("settled-why").textContent = reason;
+  $("settled").hidden = false;
+  log("settled_suggested", { reason });
+  renderConfirm();
+}
+
+function closeSettled() {
+  state.settledOpen = false;
+  $("settled").hidden = true;
+}
+
+function answerSettled(end) {
+  closeSettled();
+  log("settled_answer", { end });
+  if (end) return endSession();
+  // Keep going: judge only what happens from now on, so it doesn't nag.
+  state.settledSnoozedAt = now();
+  renderConfirm();
+}
+
 function tick() {
-  if (!state.setupOpen && !state.modalOpen && !state.ended) {
-    detectHesitation(now());
+  const t = now();
+  const running = state.everStarted && !state.setupOpen && !state.modalOpen && !state.ended;
+  if (running) {
+    detectHesitation(t);
     flushPending();
+    if (!state.settledOpen && !state.request && !state.requestBusy && t - state.lastSettledCheck > 2000) {
+      state.lastSettledCheck = t;
+      const reason = settledReason(t);
+      if (reason) openSettled(reason);
+    }
   }
   maybeRunRound();
   renderStatus();
@@ -1056,7 +1194,27 @@ function fillSetup() {
   $("p-page").value = d.pageHesitateMs / 1000;
   $("p-read").value = d.readMs / 1000;
   $("p-temp").value = d.temperature;
+  $("p-suggest-end").checked = d.suggestEnd;
+  $("p-calm").value = d.calmMs / 60000;
+  renderLayoutChoice();
   renderSetup();
+}
+
+// When a kept layout exists for the chosen app, offer it as the starting point.
+function renderLayoutChoice() {
+  const d = state.draft;
+  const saved = loadLayout(d.scenario);
+  const box = $("layout-choice");
+  box.hidden = !saved;
+  if (!saved) return;
+  const when = new Date(saved.savedAt).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  box.innerHTML = `
+    <p class="note">You kept a layout for this app on ${esc(when)} (${saved.count} ${saved.count === 1 ? "element" : "elements"} changed). Start from:</p>
+    <div class="chips">
+      <label class="chip"><input type="radio" name="base" value="saved" ${d.base === "saved" ? "checked" : ""}> Kept layout</label>
+      <label class="chip"><input type="radio" name="base" value="original" ${d.base !== "saved" ? "checked" : ""}> Original layout</label>
+      <button type="button" id="layout-forget" class="link">Forget kept layout</button>
+    </div>`;
 }
 
 function readSetup() {
@@ -1066,6 +1224,10 @@ function readSetup() {
     return Math.round((Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : fallback) * 1000);
   };
   d.scenario = $("scenarios").querySelector("input:checked")?.value ?? DEFAULT_SCENARIO;
+  d.base = $("layout-choice").querySelector('input[name="base"]:checked')?.value ?? d.base;
+  d.suggestEnd = $("p-suggest-end").checked;
+  const calm = parseFloat($("p-calm").value);
+  d.calmMs = Math.round((Number.isFinite(calm) ? Math.min(30, Math.max(0.5, calm)) : 3) * 60000);
   d.prompt = $("prompt").value;
   d.ops = [...$("ops").querySelectorAll("input:checked")].map((i) => i.dataset.op);
   d.signals = [...$("signals").querySelectorAll("input:checked")].map((i) => i.dataset.signal);
@@ -1090,10 +1252,11 @@ function renderSetup() {
     : !d.ops.length ? "Allow at least one kind of change."
     : !d.prompt.trim() ? "The prompt can't be empty."
     : "";
-  const switching = state.everStarted && d.scenario !== state.scenario;
+  const switching = state.everStarted &&
+    (d.scenario !== state.scenario || effectiveBase(d, d.scenario) !== state.baseInUse);
   $("start").disabled = Boolean(problem);
   $("start").textContent = state.everStarted ? "Apply and return" : "Start";
-  $("start-note").textContent = problem || (switching ? "Switching apps starts a new session." : "");
+  $("start-note").textContent = problem || (switching ? "Switching the app or its starting layout starts a new session." : "");
   $("setup-cancel").hidden = !state.everStarted;
 }
 
@@ -1132,7 +1295,8 @@ function start() {
   }
   state.setupOpen = false;
   state.everStarted = true;
-  const switching = state.config.scenario !== state.scenario;
+  const switching = state.config.scenario !== state.scenario ||
+    effectiveBase(state.config, state.config.scenario) !== state.baseInUse;
   if (switching) {
     state.scenario = state.config.scenario;
     resetSession();
@@ -1201,7 +1365,11 @@ function renderActivity() {
       : e.type === "welcome_closed" ? "training-mode notice closed"
       : e.type === "session_end" ? `session ended after ${fmtDuration(e.durationMs)}`
       : e.type === "session_resume" ? "session resumed"
-      : e.type === "start_over" ? `started over (${SCENARIOS[e.scenario]?.label ?? e.scenario})`
+      : e.type === "settled_suggested" ? "suggested ending: the session seems settled"
+      : e.type === "settled_answer" ? (e.end ? "chose to end the session" : "chose to keep going")
+      : e.type === "layout_saved" ? `layout kept (${e.count} elements)`
+      : e.type === "layout_forgotten" ? "kept layout forgotten"
+      : e.type === "start_over" ? `started over (${SCENARIOS[e.scenario]?.label ?? e.scenario}, ${e.base} layout)`
       : e.type === "intensity" ? `intensity: ${INTENSITIES[e.level].label}`
       : e.type === "config" ? `prompt and settings v${e.version}`
       : e.type === "engine" ? `model: ${ENGINES[e.engine].label}`
@@ -1227,6 +1395,18 @@ function setupControls() {
   $("setup").addEventListener("input", (ev) => {
     if (ev.target.id === "engine") return;
     readSetup();
+    if (ev.target.name === "scenario") renderLayoutChoice();
+    renderSetup();
+  });
+  $("setup").addEventListener("click", (ev) => {
+    if (ev.target.id !== "layout-forget") return;
+    try {
+      localStorage.removeItem(layoutKey(state.draft.scenario));
+    } catch {
+      // Nothing stored, or storage blocked: either way there's nothing to forget.
+    }
+    log("layout_forgotten", { scenario: state.draft.scenario });
+    renderLayoutChoice();
     renderSetup();
   });
   $("prompt-reset").addEventListener("click", () => {
@@ -1319,7 +1499,12 @@ function setupControls() {
     $("summary").close();
     startOver();
   });
-  $("summary-keep").addEventListener("click", () => $("summary").close());
+  $("summary-keep").addEventListener("click", () => {
+    $("summary").close();
+    saveLayout();
+  });
+  $("settled-end").addEventListener("click", () => answerSettled(true));
+  $("settled-keep").addEventListener("click", () => answerSettled(false));
   $("summary-export").addEventListener("click", exportLog);
   $("summary-resume").addEventListener("click", () => {
     $("summary").close();

@@ -202,6 +202,10 @@ button, select {
   padding: 4px 10px; font-size: 13px; cursor: pointer;
 }
 .chip:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.layout-choice { margin-top: 10px; padding: 10px 12px; border-radius: 8px; background: var(--surface-2); }
+.layout-choice[hidden] { display: none; }
+.layout-choice .note { margin: 0 0 8px !important; }
+.layout-choice .chips { align-items: center; }
 
 .params { display: flex; flex-direction: column; gap: 8px; font-size: 14px; }
 .params label { display: flex; align-items: center; gap: 8px; }
@@ -293,6 +297,7 @@ button.link { border: 0; background: none; padding: 4px 0; color: var(--accent);
 .confirm-more { margin-left: auto; font-size: 12px; color: var(--muted); }
 
 .request-target { font-weight: 600; margin-bottom: 8px !important; }
+.popover.settled { width: 340px; }
 #request-form input {
   width: 100%; font: inherit; font-size: 14px;
   border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;

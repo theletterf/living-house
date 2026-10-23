@@ -29,6 +29,7 @@
 
           <h3 class="first">App to adapt</h3>
           <div id="scenarios" class="chips"></div>
+          <div id="layout-choice" class="layout-choice" hidden></div>
 
           <h3>Base prompt</h3>
           <p class="note">The settings below add the rest: what the model may change, how eager it is, and the answer format.</p>
@@ -47,6 +48,7 @@
             <label>Hesitation on a page after <input type="number" id="p-page" min="1" max="30" step="0.5"> s</label>
             <label>Pointing at text counts after <input type="number" id="p-read" min="0.2" max="5" step="0.1"> s</label>
             <label>Temperature <input type="range" id="p-temp" min="0" max="1" step="0.05"> <output id="p-temp-out"></output></label>
+            <label><input type="checkbox" id="p-suggest-end"> Suggest ending when it seems settled, after <input type="number" id="p-calm" min="0.5" max="30" step="0.5"> min without friction</label>
           </div>
 
           <details class="preview">
@@ -90,6 +92,16 @@
       </div>
     </div>
 
+    <div id="settled" class="popover settled" role="dialog" aria-label="The session seems settled" hidden>
+      <p class="confirm-kicker">Time to wrap up?</p>
+      <p id="settled-title" class="confirm-what"></p>
+      <p id="settled-why" class="confirm-why"></p>
+      <div class="confirm-actions">
+        <button id="settled-end" type="button" class="confirm-yes">End and see what changed</button>
+        <button id="settled-keep" type="button" class="confirm-no">Keep going</button>
+      </div>
+    </div>
+
     <div id="request" class="popover" role="dialog" aria-label="Change this element" hidden>
       <form id="request-form" autocomplete="off">
         <p class="confirm-kicker">Change this</p>
@@ -116,6 +128,7 @@
       <h2 id="welcome-title">This app adapts to you</h2>
       <p>While you use it, it watches what you click, where you pause and what you select, and adjusts itself: wording, layout and styles can change to make things easier to find.</p>
       <p>You can also ask for changes: type in the bar above the app, or right-click anything and choose what should change.</p>
+      <p id="welcome-saved-note" hidden>It picks up from the layout you kept last time.</p>
       <p id="welcome-confirm-note">Before each change it suggests on its own, a small note will ask you first. Choose Apply to make the change or Not now to skip it.</p>
       <p class="welcome-small">Nothing leaves your browser. Changes can be undone at any time.</p>
       <button class="start" value="ok" autofocus>Got it</button>
@@ -158,7 +171,7 @@
         <button id="end-session" class="end">End session</button>
         <button id="start-over">Start over</button>
       </div>
-      <p class="note session-note">End stops adapting and shows a summary. Start over returns to the original layout as a fresh visit, without counting as undoing anything.</p>
+      <p class="note session-note">End stops adapting and shows a summary, where you can keep the layout for next time. Start over returns to the starting layout as a fresh visit, without counting as undoing anything.</p>
     </section>
 
     <section>
