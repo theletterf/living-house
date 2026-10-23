@@ -9,8 +9,21 @@ Takeout*). As you click, hesitate, search and select text, the model rewrites wo
 restyles anything with CSS, adds hints, reorders controls and pins shortcuts, trying to
 make what you're looking for easier to find.
 
-Inspired by [WorldTUI](https://simedw.com/2026/10/21/world-model-terminal/), a 360M
-model that pretends to be a terminal.
+The name is a nod to the Oldest House from Remedy's *Control*: a building that
+rearranges itself around whoever walks its halls. Here the building is a web app.
+
+## Inspiration
+
+The project started from Simon Edwardsson's
+[WorldTUI: I trained a 360M model to pretend to be a terminal](https://simedw.com/2026/10/21/world-model-terminal/),
+where a small model predicts how a terminal screen changes with each keypress, with no
+shell behind it:
+
+> What I really wanted to know was whether it could maintain a consistent world, or just
+> generate convincing terminal output.
+
+Living House asks a related question of interfaces: instead of imitating a fixed world,
+can a small model reshape one, in real time, around the person using it?
 
 ## Requirements
 
